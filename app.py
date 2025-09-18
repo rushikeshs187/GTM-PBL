@@ -14,7 +14,7 @@ from streamlit_folium import st_folium
 from geopy.geocoders import Nominatim
 from geopy.extra.rate_limiter import RateLimiter
 
-# ---- Optional chart library (fallback to built-ins if missing) ----
+# Optional chart library (fallback to built-ins if missing)
 try:
     import plotly.express as px
 except Exception:
@@ -35,7 +35,7 @@ section.main > div { padding-top: .75rem !important }
 .kpi p { margin:0; font-size:.8rem; color:#94a3b8 }
 label { font-size:.8rem; color:var(--muted); margin-bottom:4px; display:block }
 input, select, textarea { width:100%; padding:.55rem .7rem; border-radius:10px; border:1px solid var(--border);
-                          background:#0d1422; color:var(--ink) }
+                          background:#0d1422; color:#e7edf7 }
 .stButton>button { width:100%; background:linear-gradient(135deg, var(--primary), var(--accent));
                    color:white; border:none; font-weight:700; padding:.6rem .9rem; border-radius:10px }
 hr.soft { border:0; border-top:1px solid var(--border); margin:.8rem 0 }
@@ -107,18 +107,18 @@ def fetch_comtrade(reporter="144", flow="1", years="2019,2020,2021,2022,2023", h
         r.raise_for_status()
         return pd.DataFrame(r.json().get("dataset", []))
     except Exception:
-        # Safe fallback demo
+        # Safe fallback demo (typo fixed)
         data = [
-            {"period":2019,"ptTitle":"India","TradeValue":12000000,"NetWeight":100000},
-            {"period":2019,"ptTitle":"Denmark","TradeValue":6000000,"NetWeight":40000},
-            {"period":2020","ptTitle":"India","TradeValue":13000000,"NetWeight":110000},
-            {"period":2020,"ptTitle":"Denmark","TradeValue":5000000,"NetWeight":38000},
-            {"period":2021,"ptTitle":"India","TradeValue":16000000,"NetWeight":120000},
-            {"period":2021,"ptTitle":"Denmark","TradeValue":7000000,"NetWeight":46000},
-            {"period":2022,"ptTitle":"India","TradeValue":20000000,"NetWeight":140000},
-            {"period":2022,"ptTitle":"Denmark","TradeValue":9000000,"NetWeight":52000},
-            {"period":2023,"ptTitle":"India","TradeValue":24000000,"NetWeight":160000},
-            {"period":2023,"ptTitle":"Denmark","TradeValue":11000000,"NetWeight":60000},
+            {"period": 2019, "ptTitle": "India",   "TradeValue": 12000000, "NetWeight": 100000},
+            {"period": 2019, "ptTitle": "Denmark", "TradeValue":  6000000, "NetWeight":  40000},
+            {"period": 2020, "ptTitle": "India",   "TradeValue": 13000000, "NetWeight": 110000},
+            {"period": 2020, "ptTitle": "Denmark", "TradeValue":  5000000, "NetWeight":  38000},
+            {"period": 2021, "ptTitle": "India",   "TradeValue": 16000000, "NetWeight": 120000},
+            {"period": 2021, "ptTitle": "Denmark", "TradeValue":  7000000, "NetWeight":  46000},
+            {"period": 2022, "ptTitle": "India",   "TradeValue": 20000000, "NetWeight": 140000},
+            {"period": 2022, "ptTitle": "Denmark", "TradeValue":  9000000, "NetWeight":  52000},
+            {"period": 2023, "ptTitle": "India",   "TradeValue": 24000000, "NetWeight": 160000},
+            {"period": 2023, "ptTitle": "Denmark", "TradeValue": 11000000, "NetWeight":  60000},
         ]
         return pd.DataFrame(data)
 
@@ -159,20 +159,14 @@ def cagr(first, last, years_count):
 def safe_line(df, x, y, title):
     if px is not None:
         return st.plotly_chart(px.line(df, x=x, y=y, markers=True, title=title), use_container_width=True)
-    # fallback
-    st.subheader(title)
-    st.line_chart(df.set_index(x)[y])
+    st.subheader(title); st.line_chart(df.set_index(x)[y])
 
 def safe_bar(df, x, y, title, horizontal=False):
     if px is not None:
         fig = px.bar(df, x=x, y=y, title=title, orientation="h" if horizontal else "v")
         return st.plotly_chart(fig, use_container_width=True)
-    # fallback
     st.subheader(title)
-    if horizontal:
-        st.bar_chart(df.set_index(y)[x])
-    else:
-        st.bar_chart(df.set_index(x)[y])
+    st.bar_chart(df.set_index(y if horizontal else x)[x if horizontal else y])
 
 # =================== Header ===================
 st.markdown("<h2 style='margin:0'>GTM Global Trade & Logistics Dashboard — Sri Lanka Focus</h2>", unsafe_allow_html=True)
@@ -221,7 +215,7 @@ with r2c5:
     preset_name = st.selectbox("Preset", list(PRESETS.keys()), index=0, key="w_preset", label_visibility="collapsed")
     if st.button("Apply preset"):
         p = PRESETS[preset_name]
-        # Update only default keys, never the widget keys; then rerun
+        # Update default keys, then rerun (never write to widget keys directly)
         st.session_state["d_hs"] = p["hs"]
         st.session_state["d_incoterm"] = p["incoterm"]
         st.session_state["d_fob"] = p["fob"]
@@ -265,12 +259,10 @@ unit_vals = (ndf.groupby("year").apply(lambda g: (g["value_usd"].sum() / max(1.0
 total_trade = float(trend["value_usd"].sum()) if not trend.empty else 0.0
 _top = partners_df.iloc[0] if not partners_df.empty else pd.Series({"partner":"—","value_usd":0})
 years_sorted = sorted(trend["year"].tolist()) if not trend.empty else []
-yoy = 0.0
-cagr_val = 0.0
+yoy = 0.0; cagr_val = 0.0
 if len(years_sorted) >= 2:
     first = float(trend.loc[trend["year"]==years_sorted[0], "value_usd"].values[0])
     last  = float(trend.loc[trend["year"]==years_sorted[-1], "value_usd"].values[0])
-    # average YoY (arithmetic)
     diffs = []
     for i in range(1, len(years_sorted)):
         prev = float(trend.loc[trend["year"]==years_sorted[i-1], "value_usd"].values[0])
@@ -389,10 +381,8 @@ with m4: st.metric("Duty", f"${res['duty']:,.0f}")
 with m5: st.metric("VAT", f"${res['vat']:,.0f}")
 with m6: st.metric("Total Landed Cost", f"${res['total']:,.0f}")
 
-# Incorporate current lead time into results (display only)
 if lead_time_days:
     st.caption(f"Lead time currently estimated at {lead_time_days:.1f} days for {mode} route shown above.")
-
 st.markdown("</div>", unsafe_allow_html=True)
 
 # =================== Compare origins ===================
