@@ -394,3 +394,118 @@ with col2:
 
 st.markdown("---")
 st.caption("Always verify tariffs/NTMs on official sources (e.g., MACMAP, SL Customs). This educational tool uses public APIs and simple lead‑time models.")
+# ------------------------
+# Presets, Tariff Helper, and Packing Calculator (NEW)
+# ------------------------
+
+st.markdown("---")
+st.header("Presets • Tariff Helper • Packing / ULD Calculator")
+
+# ---- Presets
+PRESETS = {
+    "Insulin pens (retail) — HS 300431": {
+        "hs": "300431", "incoterm": "CIF", "fob": 20000.0, "freight": 2500.0, "insurance_pct": 1.0,
+        "ins_base": "FOB", "duty_pct": 0.0, "vat_pct": 8.0, "broker": 300.0, "dray": 120.0,
+        "note": "ISFTA concession likely for India→Sri Lanka pharma (verify on MACMAP)."
+    },
+    "Pharma APIs (bulk) — HS 293721 (example)": {
+        "hs": "293721", "incoterm": "FOB", "fob": 35000.0, "freight": 1800.0, "insurance_pct": 0.6,
+        "ins_base": "FOB", "duty_pct": 2.0, "vat_pct": 8.0, "broker": 350.0, "dray": 150.0,
+        "note": "APIs may have different tariff lines / NTMs; confirm exact subheading on MACMAP."
+    },
+    "Medical devices (misc.) — HS 901890 (example)": {
+        "hs": "901890", "incoterm": "CIF", "fob": 25000.0, "freight": 3200.0, "insurance_pct": 1.0,
+        "ins_base": "CIF", "duty_pct": 5.0, "vat_pct": 8.0, "broker": 320.0, "dray": 140.0,
+        "note": "Devices can face MFN duties unless FTA/GSP applies; check serial/UDI requirements."
+    },
+}
+
+with st.expander("Preset selector (auto‑fill HS & cost inputs)", expanded=True):
+    preset_name = st.selectbox("Choose a preset", list(PRESETS.keys()), index=0)
+    if st.button("Apply preset"):
+        p = PRESETS[preset_name]
+        # update UI state by rerunning with new defaults via session_state
+        st.session_state["hs"] = p["hs"]
+        st.session_state["incoterm"] = p["incoterm"]
+        st.session_state["fob"] = p["fob"]
+        st.session_state["freight"] = p["freight"]
+        st.session_state["insurance_pct"] = p["insurance_pct"]
+        st.session_state["ins_base"] = p["ins_base"]
+        st.session_state["duty_pct"] = p["duty_pct"]
+        st.session_state["vat_pct"] = p["vat_pct"]
+        st.session_state["broker"] = p["broker"]
+        st.session_state["dray"] = p["dray"]
+        st.session_state["fx_note"] = p["note"]
+        st.success("Preset applied — update your sidebar HS code and cost inputs if needed.")
+        st.stop()
+
+# ---- Tariff helper
+with st.expander("Tariff & NTM helper (MACMAP / SL Customs)", expanded=True):
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.markdown("**Quick links**")
+        st.markdown("- 🧭 [MACMAP — Tariffs & Measures](https://www.macmap.org/)\n- 📊 [TradeMap — Flows](https://www.trademap.org/)\n- 🏛️ [Sri Lanka Customs](http://www.customs.gov.lk/)")
+    with c2:
+        st.markdown("**Context**")
+        st.write("Use HS‑6 to start, then drill to HS‑8/HS‑10 for exact national lines. Check ISFTA schedules for India→Sri Lanka.")
+    with c3:
+        helper_hs = st.text_input("HS for lookup", value=st.session_state.get("hs", hs))
+        st.caption("Tip: confirm MFN vs FTA vs GSP+. Add notes below.")
+    tariff_notes = st.text_area("Your tariff/NTM notes", value=st.session_state.get("fx_note", ""), height=120)
+
+# ---- Packing / ULD calculator
+with st.expander("Packing & ULD / Container calculator", expanded=True):
+    st.write("Estimate how many cartons fit on an air PMC pallet or in sea containers. Uses simple floor‑packing (no rotation).")
+    pc1, pc2, pc3 = st.columns(3)
+    with pc1:
+        carton_l = st.number_input("Carton length (cm)", 1.0, 200.0, 40.0)
+        carton_w = st.number_input("Carton width (cm)", 1.0, 200.0, 30.0)
+        carton_h = st.number_input("Carton height (cm)", 1.0, 200.0, 25.0)
+    with pc2:
+        carton_kg = st.number_input("Carton weight (kg)", 0.1, 200.0, 8.0)
+        layer_gap = st.number_input("Layer gap (cm)", 0.0, 10.0, 0.0)
+        max_stack_h = st.number_input("Max stack height (cm)", 50.0, 250.0, 140.0)
+    with pc3:
+        use_pmc = st.checkbox("Air PMC pallet (243x318 cm) height 160 cm", value=True)
+        use_20 = st.checkbox("Sea 20' (589x235x239 cm)", value=False)
+        use_40 = st.checkbox("Sea 40' (1203x235x239 cm)", value=False)
+    
+    def pack_on(base_l, base_w, base_h):
+        per_row = math.floor(base_l // carton_l) * math.floor(base_w // carton_w)
+        layers = math.floor((min(base_h, max_stack_h)) // (carton_h + layer_gap))
+        boxes = max(0, per_row) * max(0, layers)
+        kg_total = boxes * carton_kg
+        return boxes, kg_total
+
+    results = []
+    if use_pmc:
+        b, k = pack_on(243.0, 318.0, 160.0)
+        results.append(("PMC pallet", b, k))
+    if use_20:
+        b, k = pack_on(589.0, 235.0, 239.0)
+        results.append(("20' container", b, k))
+    if use_40:
+        b, k = pack_on(1203.0, 235.0, 239.0)
+        results.append(("40' container", b, k))
+
+    if results:
+        pk_df = pd.DataFrame(results, columns=["Unit","Max cartons","Total kg"])
+        st.dataframe(pk_df, use_container_width=True)
+        fig_pk = px.bar(pk_df, x="Unit", y="Max cartons", title="Packing capacity")
+        st.plotly_chart(fig_pk, use_container_width=True)
+
+# ---- Offer requirements.txt content for deployment
+with st.expander("requirements.txt (download)", expanded=True):
+    reqs = """
+streamlit
+requests
+pandas
+numpy
+plotly
+folium
+streamlit-folium
+geopy
+    """.strip()
+    st.code(reqs, language="text")
+    st.download_button("Download requirements.txt", data=reqs, file_name="requirements.txt")
+
