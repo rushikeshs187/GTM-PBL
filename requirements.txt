@@ -6,3 +6,4 @@ folium>=0.15
 streamlit-folium>=0.13
 geopy>=2.4
 plotly>=5.18,<6
+websockets>=11,<13
