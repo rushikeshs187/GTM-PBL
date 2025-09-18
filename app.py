@@ -1,5 +1,5 @@
 # app.py — GTM Global Trade & Logistics Dashboard (Sri Lanka Focus)
-# v4.1 — Free-first live signals + Port Congestion & colored AIS markers + refined UI + precise Incoterms
+# v4.2 — Free-first live signals + Port Congestion & colored AIS markers + Diagnostics tab
 
 import io, os, json, math, datetime as dt, asyncio
 from typing import Optional, Tuple
@@ -68,7 +68,7 @@ if "theme" not in st.session_state: st.session_state["theme"] = "Light"
 if "compact" not in st.session_state: st.session_state["compact"] = False
 apply_css(st.session_state["theme"], st.session_state["compact"])
 
-# quick style switch
+# style switch
 st.markdown("<div class='card'>", unsafe_allow_html=True)
 c1, c2, c3 = st.columns([.4,.4,.2])
 with c1:
@@ -161,7 +161,7 @@ def fetch_comtrade(reporter="144", flow="1", years="2019,2020,2021,2022,2023", h
         return pd.DataFrame(data)
 
 # Geocoding & weather
-geolocator = Nominatim(user_agent="gtm_dashboard/4.1 (edu)")
+geolocator = Nominatim(user_agent="gtm_dashboard/4.2 (edu)")
 geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1, swallow_exceptions=True)
 
 @st.cache_data
@@ -544,7 +544,7 @@ with live_tab:
         handling, clearance, local = (0.8,0.8,0.3) if mode=="Air" else ((1.5,2.0,0.5) if mode=="Sea" else (0.2,0.5,0.2))
         lead_days = (dist_km/speed)/24 + handling + clearance + local
 
-        fmap = folium.Map(location=[(a[0]+b[0])/2, (a[1]+b[1])/2], zoom_start=4, control_scale=True)
+        fmap = folium.Map(location=[((a[0]+b[0])/2), ((a[1]+b[1])/2)], zoom_start=4, control_scale=True)
         folium.Marker(a, tooltip=f"Origin: {origin_q}").add_to(fmap)
         folium.Marker(b, tooltip=f"Destination: {dest_q}").add_to(fmap)
         folium.PolyLine([a,b], color="#2563eb", weight=4).add_to(fmap)
@@ -553,7 +553,6 @@ with live_tab:
         ais_df = pd.DataFrame()
         if has_key("AISSTREAM_KEY"):
             ais_df = aisstream_snapshot(d_pt[0], d_pt[1], box_km=30, seconds=8)
-            # color markers by normalized status
             color_map = {"anchored":"#f59e0b", "moored":"#ef4444", "underway":"#10b981", "other":"#64748b"}
             if not ais_df.empty:
                 for _, r in ais_df.iterrows():
@@ -837,5 +836,118 @@ with tools_tab:
         st.dataframe(pk, use_container_width=True)
         if px is not None: st.plotly_chart(px.bar(pk, x="Unit", y="Max cartons", title="Packing capacity"), use_container_width=True)
     st.markdown("</div>", unsafe_allow_html=True)
+
+# ================= Diagnostics (connectivity & keys) =================
+diag_tab = st.tabs(["Diagnostics"])[0]
+with diag_tab:
+    st.markdown("<div class='card'><b>Live integrations — self test</b>", unsafe_allow_html=True)
+
+    def _mask(v: Optional[str], show_last=4):
+        if not v: return "—"
+        v = str(v)
+        return "•"*(max(0,len(v)-show_last)) + v[-show_last:]
+
+    keys_row = pd.DataFrame([{
+        "AERODATABOX_KEY": _mask(get_secret("AERODATABOX_KEY")),
+        "AISSTREAM_KEY":   _mask(get_secret("AISSTREAM_KEY")),
+        "HERE_API_KEY":    _mask(get_secret("HERE_API_KEY")),
+        "GOOGLE_MAPS_KEY": _mask(get_secret("GOOGLE_MAPS_KEY")),
+    }]).T
+    keys_row.columns = ["visible_to_app"]
+    st.write("**Secrets detected (masked):**")
+    st.dataframe(keys_row, use_container_width=True, height=150)
+
+    st.write("**Choose a simple test route and airport** (used for pings)")
+    colA, colB, colC = st.columns(3)
+    with colA:
+        test_origin = st.text_input("Test origin (geocode)", value="Negombo, Sri Lanka")
+    with colB:
+        test_dest   = st.text_input("Test destination (geocode)", value="Colombo Port, Sri Lanka")
+    with colC:
+        test_iata   = st.text_input("Test IATA (AeroDataBox)", value="CMB")
+
+    o_geo = geocode_point(test_origin) or (7.2008,79.8737,"Negombo")
+    d_geo = geocode_point(test_dest)   or (6.9497,79.8440,"Colombo Port")
+    a=(o_geo[0], o_geo[1]); b=(d_geo[0], d_geo[1])
+
+    st.markdown("### Run pings")
+    b1, b2, b3, b4, b5, b6 = st.columns(6)
+    go_fx      = b1.button("FX (exchangerate.host)")
+    go_com     = b2.button("UN Comtrade")
+    go_marine  = b3.button("Marine (Open-Meteo)")
+    go_aero    = b4.button("AeroDataBox (arrivals)")
+    go_eta     = b5.button("Road ETA (Google/HERE)")
+    go_ais     = b6.button("AISstream snapshot")
+
+    def box(ok, title, meta, payload):
+        color = "#16a34a" if ok else "#ef4444"
+        st.markdown(f"<div class='card' style='border-color:{color}'>"
+                    f"<b style='color:{color}'>{'✅' if ok else '⚠️'} {title}</b><br>"
+                    f"<span style='color:#526581'>{meta}</span></div>", unsafe_allow_html=True)
+        if payload is not None:
+            with st.expander("Show response"):
+                if isinstance(payload, (dict,list)):
+                    st.json(payload)
+                else:
+                    st.code(str(payload))
+
+    if go_fx:
+        try:
+            r = requests.get(FX_URL, params={"base":"USD","symbols":"LKR"}, timeout=12)
+            ok = (r.status_code==200 and "rates" in r.json())
+            box(ok, "FX ping", f"HTTP {r.status_code}", r.json() if ok else r.text)
+        except Exception as e:
+            box(False, "FX ping", f"Error: {e}", None)
+
+    if go_com:
+        try:
+            r = requests.get(UN_COMTRADE, params={"type":"C","freq":"A","px":"HS","ps":"2023","r":"144","p":"all","rg":"1","cc":"300431"}, timeout=25)
+            js = r.json() if r.headers.get("content-type","").startswith("application/json") else {"text": r.text}
+            ok = (r.status_code==200 and ("dataset" in js))
+            meta = f"HTTP {r.status_code}, rows={len(js.get('dataset',[])) if isinstance(js,dict) else 'n/a'}"
+            box(ok, "UN Comtrade ping", meta, js if ok else r.text)
+        except Exception as e:
+            box(False, "UN Comtrade ping", f"Error: {e}", None)
+
+    if go_marine:
+        try:
+            js = fetch_marine(b[0], b[1])
+            ok = bool(js)
+            box(ok, "Open-Meteo Marine ping", f"Point=({b[0]:.4f},{b[1]:.4f})", js or {})
+        except Exception as e:
+            box(False, "Open-Meteo Marine ping", f"Error: {e}", None)
+
+    if go_aero:
+        try:
+            df_ping = aerodatabox_board("arrivals", test_iata.strip().upper(), limit=5)
+            ok = not df_ping.empty
+            meta = f"Rows={len(df_ping)} • Key={_mask(get_secret('AERODATABOX_KEY'))}"
+            box(ok, "AeroDataBox arrivals ping", meta, df_ping.head(5).to_dict(orient="records") if ok else "No rows")
+        except Exception as e:
+            box(False, "AeroDataBox arrivals ping", f"Error: {e}", None)
+
+    if go_eta:
+        secs = None
+        prov = None
+        try:
+            if has_key("GOOGLE_MAPS_KEY"):
+                secs = google_driving_eta(a,b); prov = "Google"
+            if secs is None and has_key("HERE_API_KEY"):
+                secs = here_driving_eta(a,b); prov = "HERE"
+            ok = secs is not None
+            meta = f"{prov or '—'} ETA = {secs/60:.1f} min" if ok else "No provider key available or no ETA"
+            box(ok, "Road ETA ping", meta, None)
+        except Exception as e:
+            box(False, "Road ETA ping", f"Error: {e}", None)
+
+    if go_ais:
+        try:
+            df_ping = aisstream_snapshot(b[0], b[1], box_km=30, seconds=6)
+            ok = not df_ping.empty
+            counts = df_ping["nav_status_norm"].value_counts().to_dict() if ok else {}
+            meta = f"Rows={len(df_ping)} • anchored={counts.get('anchored',0)} moored={counts.get('moored',0)} underway={counts.get('underway',0)}"
+            box(ok, "AISstream snapshot ping", meta, df_ping.head(10).to_dict(orient="records") if ok else "No messages received (try again)")
+        except Exception as e:
+            box(False, "AISstream snapshot ping", f"Error: {e}", None)
 
 st.caption("Educational tool. Verify tariffs/NTM rules with official sources (MACMAP, Sri Lanka Customs).")
