@@ -1,5 +1,6 @@
 # app.py — GTM Global Trade & Logistics Dashboard (Sri Lanka Focus)
-# v4.2 — Free-first live signals + Port Congestion & colored AIS markers + Diagnostics tab
+# v4.3 — Robust AeroDataBox (time window + fallback + cargo-only toggle),
+#        Port Congestion (AISstream) + colored markers, Diagnostics, refined UI.
 
 import io, os, json, math, datetime as dt, asyncio
 from typing import Optional, Tuple
@@ -18,7 +19,7 @@ except Exception:
 
 st.set_page_config(page_title="GTM — Global Trade & Logistics (Sri Lanka)", layout="wide", page_icon="📦")
 
-# ---------------- Theming ----------------
+# ===================== Theming =====================
 def apply_css(theme="Light", compact=False):
     if theme == "Light":
         bg, panel, ink, muted, border = "#f7f9fc", "#ffffff", "#0f172a", "#526581", "#e6ebf2"
@@ -48,18 +49,12 @@ def apply_css(theme="Light", compact=False):
     .hero-title {{ font-family:Inter,system-ui; letter-spacing:-.02em; font-weight:800; font-size:clamp(26px,4vw,36px); margin:0; color:var(--ink) }}
     .hero-sub {{ margin-top:6px; color:var(--muted); font-size:14px; }}
     .card {{ background:{card_grad}; border:1px solid var(--border); padding:16px; border-radius:14px; box-shadow:0 10px 34px rgba(0,0,0,.06) }}
-    .kpi-3 {{ display:grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap:.6rem }}
-    .kpi-3 .box {{ background:var(--kpi-bg); border:1px solid var(--kpi-bd); border-radius:12px; padding:.9rem 1rem; height:100% }}
-    .kpi-3 h3 {{ margin:0; font-size:1.05rem; color:var(--ink) }}
-    .kpi-3 p  {{ margin:0; font-size:.8rem; color:var(--muted) }}
     label {{ font-size:.8rem; color:var(--muted); margin-bottom:4px; display:block }}
     input, select, textarea {{ width:100%; padding:{density}; border-radius:10px; border:1px solid var(--border); background:var(--input-bg); color:var(--ink) }}
     .stButton>button {{ width:100%; background:linear-gradient(135deg, var(--primary), var(--accent)); color:white; border:none; font-weight:700; padding:.6rem .9rem; border-radius:10px }}
     .badge-ok {{ padding:.15rem .45rem; border-radius:999px; border:1px solid #16a34a; color:#16a34a; font-size:.75rem }}
     .badge-warn {{ padding:.15rem .45rem; border-radius:999px; border:1px solid #ef4444; color:#ef4444; font-size:.75rem }}
-    hr.soft {{ border:0; border-top:1px solid var(--border); margin:.8rem 0 }}
     header {{ border-bottom:none !important; }}
-    /* compact metric rows in congestion card */
     [data-testid="stMetric"] div {{ gap: .15rem; }}
     </style>
     """, unsafe_allow_html=True)
@@ -68,7 +63,6 @@ if "theme" not in st.session_state: st.session_state["theme"] = "Light"
 if "compact" not in st.session_state: st.session_state["compact"] = False
 apply_css(st.session_state["theme"], st.session_state["compact"])
 
-# style switch
 st.markdown("<div class='card'>", unsafe_allow_html=True)
 c1, c2, c3 = st.columns([.4,.4,.2])
 with c1:
@@ -83,7 +77,7 @@ with c3:
         apply_css(tsel, csel)
 st.markdown("</div>", unsafe_allow_html=True)
 
-# ---------------- Helpers & APIs ----------------
+# ===================== Helpers & APIs =====================
 UN_COMTRADE = "https://comtradeplus.un.org/api/get"
 FX_URL      = "https://api.exchangerate.host/latest"
 FX_TS_URL   = "https://api.exchangerate.host/timeseries"
@@ -145,7 +139,6 @@ def fetch_comtrade(reporter="144", flow="1", years="2019,2020,2021,2022,2023", h
         r = requests.get(UN_COMTRADE, params=params, timeout=60)
         r.raise_for_status(); return pd.DataFrame(r.json().get("dataset", []))
     except Exception:
-        # Offline fallback with >1 partner
         data = [
             {"period":2019,"ptTitle":"India","TradeValue":12000000,"NetWeight":100000},
             {"period":2019,"ptTitle":"Denmark","TradeValue":6000000,"NetWeight":40000},
@@ -161,7 +154,7 @@ def fetch_comtrade(reporter="144", flow="1", years="2019,2020,2021,2022,2023", h
         return pd.DataFrame(data)
 
 # Geocoding & weather
-geolocator = Nominatim(user_agent="gtm_dashboard/4.2 (edu)")
+geolocator = Nominatim(user_agent="gtm_dashboard/4.3 (edu)")
 geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1, swallow_exceptions=True)
 
 @st.cache_data
@@ -202,7 +195,7 @@ def fetch_marine(lat, lon):
         if not js: return None
         times = js.get("time", [])
         if not times: return None
-        idx = 0  # nearest upcoming hour
+        idx = 0
         return {
             "time": times[idx],
             "wave_height_m": float((js.get("wave_height") or [None])[idx] or 0),
@@ -213,7 +206,7 @@ def fetch_marine(lat, lon):
     except Exception:
         return None
 
-# Live providers
+# ----------------- Live providers -----------------
 def parse_iata(text: str) -> Optional[str]:
     if not text: return None
     tok = (text.strip().split() or [""])[-1]
@@ -246,25 +239,32 @@ def here_driving_eta(o: Tuple[float,float], d: Tuple[float,float]) -> Optional[i
 def best_live_road_eta(o, d) -> Optional[int]:
     return google_driving_eta(o, d) or here_driving_eta(o, d)
 
-def aerodatabox_board(endpoint: str, iata: str, limit: int = 10) -> pd.DataFrame:
+# -------- Robust AeroDataBox (time window + fallback) --------
+def aerodatabox_board(endpoint: str, iata: str, limit: int = 10, cargo_only: bool = True) -> pd.DataFrame:
     key = get_secret("AERODATABOX_KEY")
-    if not key or not iata: return pd.DataFrame()
+    if not key or not iata:
+        return pd.DataFrame()
+
     headers = {"X-RapidAPI-Key": key, "X-RapidAPI-Host": "aerodatabox.p.rapidapi.com"}
-    url = f"https://aerodatabox.p.rapidapi.com/airports/iata/{iata}/{endpoint}/now"
-    try:
-        r = requests.get(url, headers=headers, params={"withLeg":"true","withCancelled":"false"}, timeout=14)
-        r.raise_for_status()
-        js = r.json()
+
+    # Prefer a time window: now-12h → now+24h
+    now = dt.datetime.utcnow()
+    frm = (now - dt.timedelta(hours=12)).strftime("%Y-%m-%dT%H:%M")
+    to  = (now + dt.timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M")
+    url_window = f"https://aerodatabox.p.rapidapi.com/airports/iata/{iata}/{endpoint}/{frm}/{to}"
+
+    def _parse(js):
         arr = js.get("arrivals") if "arrivals" in js else js.get("departures") if "departures" in js else js
         rows=[]
-        cargo_hints = {"cargo","freighter","fx","5x","qr cargo","ek skycargo","ups","dhl","cv","lx cargo","ey cargo","sq cargo","tk cargo","qr","ru"}
-        cargo_prefix = {"FX","5X","5Y","CV","QY","RU","TK","QR","LH","SQ","EY","EK"}
-        for it in (arr or [])[:limit*3]:
+        cargo_hints = {"cargo","freighter","fx","5x","ups","dhl","cv","qf cargo","qr cargo","ek skycargo","tk cargo","sq cargo","ey cargo","ru"}
+        cargo_prefix = {"FX","5X","5Y","CV","QY","RU","TK","QR","LH","SQ","EY","EK","UPS","DHL"}
+        for it in (arr or []):
             fl = (it.get("number") or it.get("callSign") or "").upper()
             al = ((it.get("airline") or {}).get("name")) or ""
             text = f"{fl} {al}".lower()
-            is_cargo = bool(it.get("isCargo") is True or any(h in text for h in cargo_hints) or (fl[:2] in cargo_prefix))
-            if not is_cargo: continue
+            is_cargo = (it.get("isCargo") is True) or any(h in text for h in cargo_hints) or (fl[:2] in cargo_prefix)
+            if cargo_only and not is_cargo:
+                continue
             rows.append({
                 "flight": fl,
                 "from": (((it.get("departure") or {}).get("airport") or {}).get("iata")) or "",
@@ -272,13 +272,28 @@ def aerodatabox_board(endpoint: str, iata: str, limit: int = 10) -> pd.DataFrame
                 "sched_local": ((it.get("arrival") or {}).get("scheduledTimeLocal")) or ((it.get("departure") or {}).get("scheduledTimeLocal")) or "",
                 "status": it.get("status") or "",
                 "airline": al,
+                "cargo_detected": is_cargo,
             })
-            if len(rows) >= limit: break
+            if len(rows) >= limit:
+                break
         return pd.DataFrame(rows)
-    except Exception:
-        return pd.DataFrame()
 
-# -------- AISstream (free) — upgraded snapshot for congestion --------
+    try:
+        r = requests.get(url_window, headers=headers, params={"withLeg":"true","withCancelled":"false"}, timeout=14)
+        if r.ok:
+            df = _parse(r.json())
+            if not df.empty:
+                return df
+        # Fallback to “now”
+        url_now = f"https://aerodatabox.p.rapidapi.com/airports/iata/{iata}/{endpoint}/now"
+        r2 = requests.get(url_now, headers=headers, params={"withLeg":"true","withCancelled":"false"}, timeout=14)
+        if r2.ok:
+            return _parse(r2.json())
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+# -------- AISstream snapshot (for congestion & markers) --------
 @st.cache_data(show_spinner=False, ttl=60)
 def aisstream_snapshot(lat: float, lon: float, box_km: float = 30, seconds: int = 8) -> pd.DataFrame:
     key = get_secret("AISSTREAM_KEY")
@@ -290,7 +305,6 @@ def aisstream_snapshot(lat: float, lon: float, box_km: float = 30, seconds: int 
     bbox = [[lat + dlat, lon - dlon], [lat - dlat, lon + dlon]]
 
     def _norm_nav_status(raw) -> str:
-        # Normalize AIS nav status to: anchored | moored | underway | other
         if raw is None: return "other"
         try:
             code = int(raw)
@@ -360,15 +374,15 @@ def aisstream_snapshot(lat: float, lon: float, box_km: float = 30, seconds: int 
         df = df.sort_values("time_utc").drop_duplicates(subset=["mmsi"], keep="last").reset_index(drop=True)
     return df
 
-# ---------------- Hero ----------------
+# ===================== Hero =====================
 st.markdown("""
 <div class="hero">
   <div class="hero-title">GTM Global Trade & Logistics Dashboard — Sri Lanka Focus</div>
-  <div class="hero-sub">Overview • Trade • Live Ops • Costs • Tools — with free live signals (AeroDataBox, AISstream, Marine weather)</div>
+  <div class="hero-sub">Overview • Trade • Live Ops • Costs • Tools — free live signals (AeroDataBox, AISstream, Marine weather)</div>
 </div>
 """, unsafe_allow_html=True)
 
-# ---------------- Global controls ----------------
+# ===================== Global controls =====================
 st.markdown("<div class='card'>", unsafe_allow_html=True)
 r1, r2 = st.columns([1.65, 1.35])
 
@@ -407,7 +421,7 @@ with r2:
         mode = st.selectbox("mode", ["Air","Sea","Road"], index=0, label_visibility="collapsed")
 st.markdown("</div>", unsafe_allow_html=True)
 
-# ---------------- Data prep ----------------
+# ===================== Data prep =====================
 df = fetch_comtrade(reporter=reporter, flow=flow_code, years=years, hs=hs_val)
 
 def pick(df, cols, fill=None):
@@ -448,7 +462,7 @@ if len(years_sorted)>=2:
 o_pt = geocode_point(origin_q); d_pt = geocode_point(dest_q)
 fx_df, fx_vol = fetch_fx_timeseries(base="USD", symbol="LKR", days=30)
 
-# ---------------- Tabs ----------------
+# ===================== Tabs =====================
 o_tab, t_tab, live_tab, cost_tab, tools_tab = st.tabs(["Overview", "Trade", "Live Ops", "Costs", "Tools"])
 
 # ----- Overview -----
@@ -549,7 +563,10 @@ with live_tab:
         folium.Marker(b, tooltip=f"Destination: {dest_q}").add_to(fmap)
         folium.PolyLine([a,b], color="#2563eb", weight=4).add_to(fmap)
 
-        # ---- AIS (free) snapshot once, reuse for markers + congestion ----
+        # cargo-only toggle for boards
+        cargo_only = st.toggle("Cargo flights only", value=True, help="Turn off if the airport returns few/zero labelled cargo flights.")
+
+        # ---- AIS snapshot once, reuse for markers + congestion ----
         ais_df = pd.DataFrame()
         if has_key("AISSTREAM_KEY"):
             ais_df = aisstream_snapshot(d_pt[0], d_pt[1], box_km=30, seconds=8)
@@ -619,22 +636,23 @@ with live_tab:
             c1,c2 = st.columns(2)
             with c1:
                 st.caption(f"Origin departures — {oiata or '—'}")
-                dep = aerodatabox_board("departures", oiata, limit=12) if oiata else pd.DataFrame()
+                dep = aerodatabox_board("departures", oiata, limit=12, cargo_only=cargo_only) if oiata else pd.DataFrame()
                 if not dep.empty: st.dataframe(dep, use_container_width=True, height=260)
+                else: st.info("No departures returned for the current window.")
             with c2:
                 st.caption(f"Destination arrivals — {diata or '—'}")
-                arr = aerodatabox_board("arrivals", diata, limit=12) if diata else pd.DataFrame()
+                arr = aerodatabox_board("arrivals", diata, limit=12, cargo_only=cargo_only) if diata else pd.DataFrame()
                 if not arr.empty: st.dataframe(arr, use_container_width=True, height=260)
+                else: st.info("No arrivals returned for the current window.")
 
-        # -------- Port Congestion tile (uses the same AIS snapshot) --------
+        # -------- Port Congestion tile --------
         if has_key("AISSTREAM_KEY") and not ais_df.empty:
             counts = ais_df["nav_status_norm"].value_counts().to_dict()
             anchored = int(counts.get("anchored", 0))
             moored   = int(counts.get("moored",   0))
             underway = int(counts.get("underway", 0))
-            congestion_index = anchored + moored  # stationary near port
+            congestion_index = anchored + moored
 
-            # persist mini-trend
             if "ais_trend" not in st.session_state: st.session_state["ais_trend"] = []
             st.session_state["ais_trend"].append({
                 "t": dt.datetime.utcnow().strftime("%H:%M:%S"),
@@ -790,7 +808,6 @@ with cost_tab:
         b=io.StringIO(); sdf.to_csv(b, index=False)
         st.download_button("Download scenarios CSV", data=b.getvalue(), file_name="gtm_scenarios.csv", mime="text/csv")
 
-    # quick export of current
     snap = {
       "incoterm": incoterm, "invoice_value": invoice_value, "freight_included": INCOTERM_INCLUDES.get(incoterm,(False,False))[0],
       "insurance_included": INCOTERM_INCLUDES.get(incoterm,(False,False))[1],
@@ -919,7 +936,7 @@ with diag_tab:
 
     if go_aero:
         try:
-            df_ping = aerodatabox_board("arrivals", test_iata.strip().upper(), limit=5)
+            df_ping = aerodatabox_board("arrivals", test_iata.strip().upper(), limit=5, cargo_only=True)
             ok = not df_ping.empty
             meta = f"Rows={len(df_ping)} • Key={_mask(get_secret('AERODATABOX_KEY'))}"
             box(ok, "AeroDataBox arrivals ping", meta, df_ping.head(5).to_dict(orient="records") if ok else "No rows")
@@ -942,7 +959,7 @@ with diag_tab:
 
     if go_ais:
         try:
-            df_ping = aisstream_snapshot(b[0], b[1], box_km=30, seconds=6)
+            df_ping = aisstream_snapshot(b[0], b[1], box_km=30, seconds=8)
             ok = not df_ping.empty
             counts = df_ping["nav_status_norm"].value_counts().to_dict() if ok else {}
             meta = f"Rows={len(df_ping)} • anchored={counts.get('anchored',0)} moored={counts.get('moored',0)} underway={counts.get('underway',0)}"
