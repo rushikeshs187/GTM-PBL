@@ -1,4 +1,4 @@
-# GTM Global Trade & Logistics Dashboard — Sri Lanka Focus (Refined + Integrated Map)
+# GTM Global Trade & Logistics Dashboard — Sri Lanka Focus (Refined + Hero + Integrated Map)
 # Live trade (UN Comtrade), FX, Landed Cost, Route & Lead Time (map), Presets, Tariff Helper, Packing
 # Design: No sidebar. Top control ribbon. KPI row. Charts + Map side-by-side. Error-hardened.
 
@@ -25,20 +25,72 @@ st.set_page_config(page_title="GTM — Global Trade & Logistics (Sri Lanka)", la
 # =================== Styles ===================
 st.markdown("""
 <style>
-:root { --bg:#0b0f14; --panel:#101621; --muted:#9fb0c4; --ink:#e7edf7; --border:#1e2b3c; --primary:#60a5fa; --accent:#a78bfa; }
-section.main > div { padding-top: .75rem !important }
+/* Import a crisp variable font */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap');
+
+:root{
+  --bg:#0b0f14; --panel:#0f1521; --muted:#9fb0c4; --ink:#e7edf7;
+  --border:#1e2b3c; --primary:#60a5fa; --accent:#a78bfa;
+}
+
+/* App background */
+html, body, .stApp { background: var(--bg) !important; }
+
+/* Reset heading letter spacing (fixes odd tracking) */
+h1, h2, h3, .hero-title {
+  letter-spacing: -0.02em !important;
+  font-variant-ligatures: normal !important;
+  font-feature-settings: "liga" 1, "calt" 1 !important;
+  font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif !important;
+}
+
+/* Global text */
+body, .stMarkdown, p, label, input, select, textarea {
+  font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif !important;
+  color: var(--ink);
+}
+
+/* Hero */
+.hero {
+  border-radius: 18px;
+  padding: 28px 28px 22px;
+  background: radial-gradient(1200px 400px at 0% -10%, rgba(96,165,250,.15), transparent 60%),
+              radial-gradient(1200px 400px at 100% 110%, rgba(167,139,250,.12), transparent 60%),
+              linear-gradient(180deg, rgba(18,26,40,.92), rgba(10,15,25,.92));
+  border: 1px solid var(--border);
+  box-shadow: 0 18px 40px rgba(0,0,0,.35);
+  margin-bottom: 12px;
+}
+.hero-title {
+  font-size: clamp(28px, 4vw, 40px);
+  line-height: 1.1;
+  font-weight: 800;
+  margin: 0;
+}
+.hero-sub {
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+/* Cards & layout */
 .card { background: linear-gradient(180deg, rgba(21,30,48,.94), rgba(12,17,28,.92));
         border:1px solid var(--border); padding:16px; border-radius:14px; box-shadow:0 12px 40px rgba(0,0,0,.35) }
 .kpi { display:grid; grid-template-columns: repeat(6, minmax(0,1fr)); gap:.6rem }
 .kpi .box { background:#0f172a; border:1px solid #1e293b; border-radius:12px; padding:.9rem 1rem; height:100% }
 .kpi h3 { margin:0; font-size:1.15rem }
-.kpi p { margin:0; font-size:.8rem; color:#94a3b8 }
+.kpi p  { margin:0; font-size:.8rem; color:#94a3b8 }
+
 label { font-size:.8rem; color:var(--muted); margin-bottom:4px; display:block }
 input, select, textarea { width:100%; padding:.55rem .7rem; border-radius:10px; border:1px solid var(--border);
                           background:#0d1422; color:#e7edf7 }
 .stButton>button { width:100%; background:linear-gradient(135deg, var(--primary), var(--accent));
                    color:white; border:none; font-weight:700; padding:.6rem .9rem; border-radius:10px }
+
 hr.soft { border:0; border-top:1px solid var(--border); margin:.8rem 0 }
+
+/* Remove any weird top border from themes */
+header { border-bottom: none !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -107,7 +159,7 @@ def fetch_comtrade(reporter="144", flow="1", years="2019,2020,2021,2022,2023", h
         r.raise_for_status()
         return pd.DataFrame(r.json().get("dataset", []))
     except Exception:
-        # Safe fallback demo (typo fixed)
+        # Safe fallback demo
         data = [
             {"period": 2019, "ptTitle": "India",   "TradeValue": 12000000, "NetWeight": 100000},
             {"period": 2019, "ptTitle": "Denmark", "TradeValue":  6000000, "NetWeight":  40000},
@@ -168,16 +220,20 @@ def safe_bar(df, x, y, title, horizontal=False):
     st.subheader(title)
     st.bar_chart(df.set_index(y if horizontal else x)[x if horizontal else y])
 
-# =================== Header ===================
-st.markdown("<h2 style='margin:0'>GTM Global Trade & Logistics Dashboard — Sri Lanka Focus</h2>", unsafe_allow_html=True)
-st.caption("Live trade • FX • Landed cost • Routes (map) • Packing • Presets")
+# =================== Hero ===================
+st.markdown("""
+<div class="hero">
+  <div class="hero-title">GTM Global Trade & Logistics Dashboard — Sri Lanka Focus</div>
+  <div class="hero-sub">Live trade • FX • Landed cost • Routes (map) • Packing • Presets</div>
+</div>
+""", unsafe_allow_html=True)
 
 # =================== Top Control Ribbon (no sidebar) ===================
 fx_live = fetch_fx()
 fx_rate_live = float(fx_live.get("LKR", 0) or 0)
 
 st.markdown("<div class='card'>", unsafe_allow_html=True)
-# Row 1 controls
+# Row 1
 r1c1, r1c2, r1c3, r1c4 = st.columns([1.6, 1, 1, .9])
 with r1c1:
     st.markdown("<label>HS code (6-digit)</label>", unsafe_allow_html=True)
@@ -195,7 +251,7 @@ with r1c4:
     years = st.selectbox("years", ["2019,2020,2021,2022,2023","2020,2021,2022,2023,2024","2018,2019,2020,2021,2022"],
                          index=0, key="w_years", label_visibility="collapsed")
 
-# Row 2 controls
+# Row 2
 r2c1, r2c2, r2c3, r2c4, r2c5 = st.columns([1, 1, 1, .8, .8])
 with r2c1:
     st.markdown("<label>USD→LKR override (optional)</label>", unsafe_allow_html=True)
