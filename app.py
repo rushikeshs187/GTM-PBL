@@ -1,38 +1,25 @@
 # app.py — GTM Global Trade & Logistics Dashboard (Sri Lanka Focus)
-# Live trade (UN Comtrade), FX, Route & Map, Lead Time, Emissions, Landed Cost, Packing, Scenarios
-# + Live Logistics Providers:
-#   (1) Google Maps Distance Matrix: traffic-aware Road ETA  -> GOOGLE_MAPS_KEY
-#   (2) AeroDataBox: live airport arrivals/departures        -> AERODATABOX_KEY (RapidAPI)
-#   (3) MarineTraffic: AIS vessels in bounding box           -> MARINETRAFFIC_KEY
+# Adds LIVE CARGO views (AeroDataBox cargo flights, MarineTraffic cargo vessels) and removes "Tip:" captions.
 
-import io
-import os
-import json
-import math
-import datetime as dt
+import io, os, json, math, datetime as dt
 from typing import Optional, Tuple
 
-import requests
-import pandas as pd
-import numpy as np
-import streamlit as st
+import requests, pandas as pd, numpy as np, streamlit as st
 import folium
 from streamlit_folium import st_folium
 from geopy.geocoders import Nominatim
 from geopy.extra.rate_limiter import RateLimiter
 
-# Optional charts (app works even if Plotly isn't available)
 try:
     import plotly.express as px
 except Exception:
     px = None
 
-# --------------- Page setup ---------------
 st.set_page_config(page_title="GTM — Global Trade & Logistics (Sri Lanka)", layout="wide", page_icon="📦")
 
-# --------------- Defaults ---------------
+# ---------- defaults ----------
 def ensure_defaults():
-    st.session_state.setdefault("theme", "Light")      # Light | Dark
+    st.session_state.setdefault("theme", "Light")
     st.session_state.setdefault("compact", False)
     st.session_state.setdefault("d_hs", "300431")
     st.session_state.setdefault("d_incoterm", "CIF")
@@ -48,7 +35,7 @@ def ensure_defaults():
     st.session_state.setdefault("scenarios", [])
 ensure_defaults()
 
-# --------------- Theme / CSS ---------------
+# ---------- theme ----------
 def render_css(theme="Light", compact=False):
     if theme == "Light":
         bg, panel, ink, muted, border = "#f7f9fc", "#ffffff", "#0f172a", "#526581", "#e6ebf2"
@@ -57,8 +44,7 @@ def render_css(theme="Light", compact=False):
         hero_grad = ("radial-gradient(1200px 400px at 0% -10%, rgba(37,99,235,.10), transparent 60%),"
                      "radial-gradient(1200px 400px at 100% 110%, rgba(124,58,237,.08), transparent 60%),"
                      "linear-gradient(180deg, rgba(255,255,255,.98), rgba(255,255,255,.98))")
-        kpi_bg, kpi_bd = "#f3f6fb", "#e6ebf2"
-        input_bg = "#fbfdff"
+        kpi_bg, kpi_bd, input_bg = "#f3f6fb", "#e6ebf2", "#fbfdff"
     else:
         bg, panel, ink, muted, border = "#0b0f14", "#0f1521", "#e7edf7", "#9fb0c4", "#1e2b3c"
         primary, accent = "#60a5fa", "#a78bfa"
@@ -66,56 +52,33 @@ def render_css(theme="Light", compact=False):
         hero_grad = ("radial-gradient(1200px 400px at 0% -10%, rgba(96,165,250,.15), transparent 60%),"
                      "radial-gradient(1200px 400px at 100% 110%, rgba(167,139,250,.12), transparent 60%),"
                      "linear-gradient(180deg, rgba(18,26,40,.92), rgba(10,15,25,.92))")
-        kpi_bg, kpi_bd = "#0f172a", "#1e293b"
-        input_bg = "#0d1422"
+        kpi_bg, kpi_bd, input_bg = "#0f172a", "#1e293b", "#0d1422"
 
     density_pad = ".5rem .7rem" if compact else ".62rem .8rem"
     st.markdown(f"""
     <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap');
-    :root {{
-      --bg:{bg}; --panel:{panel}; --muted:{muted}; --ink:{ink};
-      --border:{border}; --primary:{primary}; --accent:{accent};
-      --kpi-bg:{kpi_bg}; --kpi-bd:{kpi_bd}; --input-bg:{input_bg};
-    }}
+    :root {{ --bg:{bg}; --panel:{panel}; --muted:{muted}; --ink:{ink}; --border:{border};
+            --primary:{primary}; --accent:{accent}; --kpi-bg:{kpi_bg}; --kpi-bd:{kpi_bd}; --input-bg:{input_bg}; }}
     html, body, .stApp {{ background: var(--bg) !important; }}
-    h1, h2, h3, .hero-title {{
-      letter-spacing: -0.02em !important;
-      font-variant-ligatures: normal !important;
-      font-feature-settings: "liga" 1, "calt" 1 !important;
-      font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif !important;
-      color: var(--ink);
-    }}
-    body, .stMarkdown, p, label, input, select, textarea {{
-      font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif !important;
-      color: var(--ink);
-    }}
-    .hero {{
-      border-radius: 18px; padding: 26px 24px 20px;
-      background: {hero_grad};
-      border: 1px solid var(--border);
-      box-shadow: 0 18px 40px rgba(0,0,0,.07);
-      margin-bottom: 12px;
-    }}
-    .hero-title {{ font-size: clamp(28px, 4vw, 40px); line-height: 1.1; font-weight: 800; margin: 0; }}
-    .hero-sub {{ margin-top: 6px; color: var(--muted); font-size: 14px; }}
-    .card {{ background: {card_grad}; border:1px solid var(--border); padding:16px; border-radius:14px; box-shadow:0 12px 40px rgba(0,0,0,.06) }}
+    h1, h2, h3, .hero-title {{ letter-spacing:-.02em; font-feature-settings:"liga" 1, "calt" 1; font-family:Inter,system-ui; color:var(--ink); }}
+    .hero {{ border-radius:18px; padding:26px 24px 20px; background:{hero_grad}; border:1px solid var(--border); box-shadow:0 18px 40px rgba(0,0,0,.07); margin-bottom:12px; }}
+    .hero-title {{ font-size:clamp(28px,4vw,40px); line-height:1.1; font-weight:800; margin:0; }}
+    .hero-sub {{ margin-top:6px; color:var(--muted); font-size:14px; }}
+    .card {{ background:{card_grad}; border:1px solid var(--border); padding:16px; border-radius:14px; box-shadow:0 12px 40px rgba(0,0,0,.06) }}
     .kpi {{ display:grid; grid-template-columns: repeat(6, minmax(0,1fr)); gap:.6rem }}
     .kpi .box {{ background:var(--kpi-bg); border:1px solid var(--kpi-bd); border-radius:12px; padding:.9rem 1rem; height:100% }}
     .kpi h3 {{ margin:0; font-size:1.05rem }}
     .kpi p  {{ margin:0; font-size:.8rem; color:var(--muted) }}
-    label {{ font-size:.8rem; color: var(--muted); margin-bottom:4px; display:block }}
-    input, select, textarea {{ width:100%; padding:{density_pad}; border-radius:10px; border:1px solid var(--border);
-                               background:var(--input-bg); color:var(--ink) }}
-    .stButton>button {{ width:100%; background:linear-gradient(135deg, var(--primary), var(--accent));
-                        color:white; border:none; font-weight:700; padding:.6rem .9rem; border-radius:10px }}
+    label {{ font-size:.8rem; color:var(--muted); margin-bottom:4px; display:block }}
+    input, select, textarea {{ width:100%; padding:{density_pad}; border-radius:10px; border:1px solid var(--border); background:var(--input-bg); color:var(--ink) }}
+    .stButton>button {{ width:100%; background:linear-gradient(135deg, var(--primary), var(--accent)); color:white; border:none; font-weight:700; padding:.6rem .9rem; border-radius:10px }}
     .warn {{ background:#fff7ed; color:#9a3412; border:1px solid #fed7aa; padding:.5rem .7rem; border-radius:10px }}
     hr.soft {{ border:0; border-top:1px solid var(--border); margin:.8rem 0 }}
-    header {{ border-bottom: none !important; }}
+    header {{ border-bottom:none !important; }}
     </style>
     """, unsafe_allow_html=True)
 
-# Top settings bar (theme + compact)
 st.markdown("<div class='card'>", unsafe_allow_html=True)
 s1, s2, s3 = st.columns([.4,.4,.2])
 with s1:
@@ -131,7 +94,7 @@ with s3:
 st.markdown("</div>", unsafe_allow_html=True)
 render_css(st.session_state["theme"], st.session_state["compact"])
 
-# --------------- Constants ---------------
+# ---------- constants ----------
 UN_COMTRADE = "https://comtradeplus.un.org/api/get"
 FX_URL = "https://api.exchangerate.host/latest"
 OPEN_METEO = "https://api.open-meteo.com/v1/forecast"
@@ -151,26 +114,14 @@ PRESETS = {
         "hs": "300431", "incoterm": "CIF", "fob": 20000.0, "freight": 2500.0, "insurance_pct": 1.0,
         "ins_base": "FOB", "duty_pct": 0.0, "vat_pct": 8.0, "broker": 300.0, "dray": 120.0,
         "note": "ISFTA concession likely for India→Sri Lanka pharma (verify on MACMAP)."
-    },
-    "Pharma APIs (bulk) — HS 293721 (example)": {
-        "hs": "293721", "incoterm": "FOB", "fob": 35000.0, "freight": 1800.0, "insurance_pct": 0.6,
-        "ins_base": "FOB", "duty_pct": 2.0, "vat_pct": 8.0, "broker": 350.0, "dray": 150.0,
-        "note": "APIs may have different tariff lines/NTMs; confirm exact subheading on MACMAP."
-    },
-    "Medical devices (misc.) — HS 901890 (example)": {
-        "hs": "901890", "incoterm": "CIF", "fob": 25000.0, "freight": 3200.0, "insurance_pct": 1.0,
-        "ins_base": "CIF", "duty_pct": 5.0, "vat_pct": 8.0, "broker": 320.0, "dray": 140.0,
-        "note": "Devices can face MFN duties unless FTA/GSP applies; check serial/UDI requirements."
-    },
+    }
 }
 
-# --------------- Utilities ---------------
+# ---------- helpers ----------
 def get_secret(name: str) -> Optional[str]:
-    """Read from Streamlit secrets or environment."""
     try:
         v = st.secrets.get(name)
-        if v:
-            return str(v)
+        if v: return str(v)
     except Exception:
         pass
     return os.getenv(name)
@@ -192,7 +143,6 @@ def fetch_comtrade(reporter="144", flow="1", years="2019,2020,2021,2022,2023", h
         r.raise_for_status()
         return pd.DataFrame(r.json().get("dataset", []))
     except Exception:
-        # Safe fallback demo data
         data = [
             {"period":2019,"ptTitle":"India","TradeValue":12000000,"NetWeight":100000},
             {"period":2019,"ptTitle":"Denmark","TradeValue":6000000,"NetWeight":40000},
@@ -213,17 +163,14 @@ def pick_col(df: pd.DataFrame, names, fill=None):
             return df[n]
     return pd.Series([fill] * len(df)) if fill is not None else pd.Series(dtype=float)
 
-# Geocoding + distance
-geolocator = Nominatim(user_agent="gtm_dashboard/1.3 (edu)")
+geolocator = Nominatim(user_agent="gtm_dashboard/1.4 (edu)")
 geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1, swallow_exceptions=True)
 
 @st.cache_data
 def geocode_point(q: str):
-    if not q:
-        return None
+    if not q: return None
     loc = geocode(q)
-    if not loc:
-        return None
+    if not loc: return None
     return (loc.latitude, loc.longitude, loc.address)
 
 @st.cache_data
@@ -236,154 +183,127 @@ def haversine_km(a, b):
     return 2 * R * np.arcsin(np.sqrt(h))
 
 def cagr(first, last, n):
-    if first <= 0 or n <= 0:
-        return 0.0
+    if first <= 0 or n <= 0: return 0.0
     return (last/first)**(1/n) - 1
 
 def safe_line(df, x, y, title):
-    if px is not None:
-        st.plotly_chart(px.line(df, x=x, y=y, markers=True, title=title), use_container_width=True)
-    else:
-        st.subheader(title); st.line_chart(df.set_index(x)[y])
+    if px is not None: st.plotly_chart(px.line(df, x=x, y=y, markers=True, title=title), use_container_width=True)
+    else: st.subheader(title); st.line_chart(df.set_index(x)[y])
 
 def safe_bar(df, x, y, title, horizontal=False):
-    if px is not None:
-        st.plotly_chart(px.bar(df, x=x, y=y, title=title, orientation="h" if horizontal else "v"), use_container_width=True)
-    else:
-        st.subheader(title); st.bar_chart(df.set_index(y if horizontal else x)[x if horizontal else y])
+    if px is not None: st.plotly_chart(px.bar(df, x=x, y=y, title=title, orientation="h" if horizontal else "v"), use_container_width=True)
+    else: st.subheader(title); st.bar_chart(df.set_index(y if horizontal else x)[x if horizontal else y])
 
-# Weather (for small operational risk hint)
 @st.cache_data(show_spinner=False, ttl=900)
 def fetch_weather(lat, lon):
     try:
-        params = {"latitude": lat, "longitude": lon, "current": "temperature_2m,precipitation,wind_speed_10m"}
-        r = requests.get(OPEN_METEO, params=params, timeout=12)
+        r = requests.get(OPEN_METEO, params={"latitude":lat, "longitude":lon, "current":"temperature_2m,precipitation,wind_speed_10m"}, timeout=12)
         r.raise_for_status()
         return r.json().get("current", {})
     except Exception:
         return {}
 
 def weather_risk(cur):
-    if not cur:
-        return "N/A", "—"
+    if not cur: return "N/A", "—"
     wind = float(cur.get("wind_speed_10m", 0) or 0)
     precip = float(cur.get("precipitation", 0) or 0)
-    if wind >= 12 or precip >= 5:
-        return "High", f"Wind {wind} m/s, precip {precip} mm"
-    if wind >= 8 or precip >= 2:
-        return "Moderate", f"Wind {wind} m/s, precip {precip} mm"
+    if wind >= 12 or precip >= 5: return "High", f"Wind {wind} m/s, precip {precip} mm"
+    if wind >= 8 or precip >= 2:  return "Moderate", f"Wind {wind} m/s, precip {precip} mm"
     return "OK", f"Wind {wind} m/s, precip {precip} mm"
 
-# --------------- Live Provider Helpers ---------------
-
+# ---------- LIVE providers (with cargo filters) ----------
 def parse_iata(text: str) -> Optional[str]:
-    """Pull a trailing IATA code (e.g., 'Colombo CMB' -> 'CMB')."""
-    if not text:
-        return None
+    if not text: return None
     token = (text.strip().split() or [""])[-1]
-    return token if len(token) == 3 and token.isalpha() and token.isupper() else None
+    return token if len(token)==3 and token.isalpha() and token.isupper() else None
 
-# (1) Google Maps (or HERE) traffic-aware road ETA
-def google_driving_eta(origin_latlon: Tuple[float, float], dest_latlon: Tuple[float, float]) -> Optional[int]:
+# (1) Google/HERE traffic-aware road ETA
+def google_driving_eta(origin_latlon: Tuple[float,float], dest_latlon: Tuple[float,float]) -> Optional[int]:
     key = get_secret("GOOGLE_MAPS_KEY")
-    if not key:
-        return None
+    if not key: return None
     base = "https://maps.googleapis.com/maps/api/distancematrix/json"
-    params = {
-        "origins": f"{origin_latlon[0]},{origin_latlon[1]}",
-        "destinations": f"{dest_latlon[0]},{dest_latlon[1]}",
-        "departure_time": "now",
-        "key": key,
-    }
+    params = {"origins":f"{origin_latlon[0]},{origin_latlon[1]}",
+              "destinations":f"{dest_latlon[0]},{dest_latlon[1]}",
+              "departure_time":"now","key":key}
     try:
-        r = requests.get(base, params=params, timeout=12)
-        r.raise_for_status()
-        data = r.json()
-        elem = data["rows"][0]["elements"][0]
+        r = requests.get(base, params=params, timeout=12); r.raise_for_status()
+        elem = r.json()["rows"][0]["elements"][0]
         secs = (elem.get("duration_in_traffic") or elem.get("duration") or {}).get("value")
         return int(secs) if secs is not None else None
     except Exception:
         return None
 
-def here_driving_eta(origin_latlon: Tuple[float, float], dest_latlon: Tuple[float, float]) -> Optional[int]:
-    key = get_secret("HERE_API_KEY")  # optional fallback
-    if not key:
-        return None
+def here_driving_eta(origin_latlon: Tuple[float,float], dest_latlon: Tuple[float,float]) -> Optional[int]:
+    key = get_secret("HERE_API_KEY")
+    if not key: return None
     base = "https://router.hereapi.com/v8/routes"
-    params = {
-        "transportMode": "car",
-        "origin": f"{origin_latlon[0]},{origin_latlon[1]}",
-        "destination": f"{dest_latlon[0]},{dest_latlon[1]}",
-        "return": "summary",
-        "departureTime": "now",
-        "apikey": key,
-    }
+    params = {"transportMode":"car", "origin":f"{origin_latlon[0]},{origin_latlon[1]}",
+              "destination":f"{dest_latlon[0]},{dest_latlon[1]}", "return":"summary",
+              "departureTime":"now", "apikey":key}
     try:
-        r = requests.get(base, params=params, timeout=12)
-        r.raise_for_status()
-        data = r.json()
-        secs = data["routes"][0]["sections"][0]["summary"]["duration"]
-        return int(secs)
+        r = requests.get(base, params=params, timeout=12); r.raise_for_status()
+        return int(r.json()["routes"][0]["sections"][0]["summary"]["duration"])
     except Exception:
         return None
 
-def best_live_road_eta(origin_latlon, dest_latlon) -> Optional[int]:
-    secs = google_driving_eta(origin_latlon, dest_latlon)
-    if secs is None:
-        secs = here_driving_eta(origin_latlon, dest_latlon)
-    return secs
+def best_live_road_eta(o, d) -> Optional[int]:
+    return google_driving_eta(o,d) or here_driving_eta(o,d)
 
-# (2) AeroDataBox (RapidAPI) — live arrivals/departures
-def aerodatabox_arrivals(iata: str, limit: int = 10) -> pd.DataFrame:
+# (2) AeroDataBox — cargo flight boards (heuristic + isCargo if present)
+CARGO_AIRLINE_HINTS = {"cargo","freighter","fx","5x","qr cargo","ek skycargo","ups","dhl","qx","cv","lx cargo","ey cargo","sq cargo","tk cargo","qr"}
+CARGO_IATA_PREFIXES = {"FX","5X","5Y","CV","QY","RU","TK","ET","QR","LH","SQ","EY","EK","ULC"}  # includes common cargo ops; heuristic
+
+def is_cargo_row(row: dict) -> bool:
+    try:
+        # explicit flag if exists
+        if isinstance(row.get("isCargo"), bool):
+            return row["isCargo"]
+    except Exception:
+        pass
+    fl = (row.get("number") or row.get("flight") or "").upper()
+    al = ((row.get("airline") or {}).get("name") if isinstance(row.get("airline"), dict) else row.get("airline")) or ""
+    text = f"{fl} {al}".lower()
+    if any(h in text for h in CARGO_AIRLINE_HINTS): return True
+    if fl[:2] in CARGO_IATA_PREFIXES: return True
+    return False
+
+def aerodatabox_board(endpoint: str, iata: str, limit: int = 10) -> pd.DataFrame:
     key = get_secret("AERODATABOX_KEY")
-    if not key or not iata:
-        return pd.DataFrame()
+    if not key or not iata: return pd.DataFrame()
     headers = {"X-RapidAPI-Key": key, "X-RapidAPI-Host": "aerodatabox.p.rapidapi.com"}
-    url = f"https://aerodatabox.p.rapidapi.com/airports/iata/{iata}/arrivals/now"
+    url = f"https://aerodatabox.p.rapidapi.com/airports/iata/{iata}/{endpoint}/now"
     try:
         r = requests.get(url, headers=headers, params={"withLeg":"true","withCancelled":"false"}, timeout=14)
         r.raise_for_status()
         js = r.json()
-        arr = js.get("arrivals") or js
+        arr = js.get("arrivals") if "arrivals" in js else js.get("departures") if "departures" in js else js
         rows=[]
-        for a in arr[:limit]:
-            rows.append({
-                "flight": a.get("number") or a.get("callSign") or "",
-                "from": (((a.get("departure") or {}).get("airport") or {}).get("iata")) or "",
-                "sched_local": ((a.get("arrival") or {}).get("scheduledTimeLocal")) or "",
-                "status": a.get("status") or "",
-                "airline": ((a.get("airline") or {}).get("name")) or "",
-            })
+        for it in (arr or [])[:limit*3]:  # fetch more, then filter
+            row = {
+                "flight": it.get("number") or it.get("callSign") or "",
+                "from": (((it.get("departure") or {}).get("airport") or {}).get("iata")) or "",
+                "to": (((it.get("arrival") or {}).get("airport") or {}).get("iata")) or "",
+                "sched_local": ((it.get("arrival") or {}).get("scheduledTimeLocal")) or ((it.get("departure") or {}).get("scheduledTimeLocal")) or "",
+                "status": it.get("status") or "",
+                "airline": ((it.get("airline") or {}).get("name")) or "",
+                "isCargo": it.get("isCargo"),
+            }
+            if is_cargo_row(row):
+                rows.append(row)
+            if len(rows) >= limit:
+                break
         return pd.DataFrame(rows)
     except Exception:
         return pd.DataFrame()
 
-def aerodatabox_departures(iata: str, limit: int = 10) -> pd.DataFrame:
-    key = get_secret("AERODATABOX_KEY")
-    if not key or not iata:
-        return pd.DataFrame()
-    headers = {"X-RapidAPI-Key": key, "X-RapidAPI-Host": "aerodatabox.p.rapidapi.com"}
-    url = f"https://aerodatabox.p.rapidapi.com/airports/iata/{iata}/departures/now"
-    try:
-        r = requests.get(url, headers=headers, params={"withLeg":"true","withCancelled":"false"}, timeout=14)
-        r.raise_for_status()
-        js = r.json()
-        dep = js.get("departures") or js
-        rows=[]
-        for d in dep[:limit]:
-            rows.append({
-                "flight": d.get("number") or d.get("callSign") or "",
-                "to": (((d.get("arrival") or {}).get("airport") or {}).get("iata")) or "",
-                "sched_local": ((d.get("departure") or {}).get("scheduledTimeLocal")) or "",
-                "status": d.get("status") or "",
-                "airline": ((d.get("airline") or {}).get("name")) or "",
-            })
-        return pd.DataFrame(rows)
-    except Exception:
-        return pd.DataFrame()
+def aerodatabox_arrivals_cargo(iata: str, limit: int = 10) -> pd.DataFrame:
+    return aerodatabox_board("arrivals", iata, limit)
 
-# (3) MarineTraffic — AIS in bounding box (last ~20min)
-def marinetraffic_bbox(lat: float, lon: float, box_km: float = 30) -> pd.DataFrame:
+def aerodatabox_departures_cargo(iata: str, limit: int = 10) -> pd.DataFrame:
+    return aerodatabox_board("departures", iata, limit)
+
+# (3) MarineTraffic — cargo vessels only (type 70–79)
+def marinetraffic_cargo_bbox(lat: float, lon: float, box_km: float = 30) -> pd.DataFrame:
     key = get_secret("MARINETRAFFIC_KEY")
     if not key or lat is None or lon is None:
         return pd.DataFrame()
@@ -392,33 +312,38 @@ def marinetraffic_bbox(lat: float, lon: float, box_km: float = 30) -> pd.DataFra
     bbox = f"{lon-dlon},{lat-dlat},{lon+dlon},{lat+dlat}"
     url = f"https://services.marinetraffic.com/api/exportvessel/v:5/{key}/timespan:20/protocol:json/bbox:{bbox}"
     try:
-        r = requests.get(url, timeout=12)
-        r.raise_for_status()
+        r = requests.get(url, timeout=12); r.raise_for_status()
         data = r.json() if r.headers.get("content-type","").startswith("application/json") else []
         rows=[]
         for v in data:
-            rows.append({
-                "mmsi": v.get("MMSI"),
-                "shipname": v.get("SHIPNAME"),
-                "type": v.get("SHIPTYPE"),
-                "lat": v.get("LAT"), "lon": v.get("LON"),
-                "speed_kn": v.get("SPEED"),
-                "course": v.get("COURSE"),
-                "ts": v.get("TIMESTAMP"),
-            })
+            t = v.get("SHIPTYPE")
+            if t is None: continue
+            try:
+                t = int(t)
+            except Exception:
+                continue
+            if 70 <= t <= 79:  # cargo
+                rows.append({
+                    "shipname": v.get("SHIPNAME"),
+                    "type": t,
+                    "lat": v.get("LAT"), "lon": v.get("LON"),
+                    "speed_kn": v.get("SPEED"),
+                    "course": v.get("COURSE"),
+                    "ts": v.get("TIMESTAMP"),
+                })
         return pd.DataFrame(rows)
     except Exception:
         return pd.DataFrame()
 
-# --------------- Hero ---------------
+# ---------- hero ----------
 st.markdown("""
 <div class="hero">
   <div class="hero-title">GTM Global Trade & Logistics Dashboard — Sri Lanka Focus</div>
-  <div class="hero-sub">Live trade • FX • Routes & map • Weather • Live traffic ETA • Airport boards • AIS • Landed cost • Packing • Scenarios</div>
+  <div class="hero-sub">Live trade • FX • Routes & map • Weather • <b>Cargo flights</b> • <b>Cargo vessels</b> • Landed cost • Packing • Scenarios</div>
 </div>
 """, unsafe_allow_html=True)
 
-# --------------- Top controls ---------------
+# ---------- controls ----------
 fx_live = fetch_fx(); fx_rate_live = float(fx_live.get("LKR", 0) or 0)
 
 st.markdown("<div class='card'>", unsafe_allow_html=True)
@@ -436,8 +361,7 @@ with r1c3:
     flow_code = "1" if flow == "Imports" else "2"
 with r1c4:
     st.markdown("<label>Years</label>", unsafe_allow_html=True)
-    years = st.selectbox("years", ["2019,2020,2021,2022,2023","2020,2021,2022,2023,2024","2018,2019,2020,2021,2022"],
-                         index=0, key="w_years", label_visibility="collapsed")
+    years = st.selectbox("years", ["2019,2020,2021,2022,2023","2020,2021,2022,2023,2024","2018,2019,2020,2021,2022"], index=0, key="w_years", label_visibility="collapsed")
 
 r2c1, r2c2, r2c3, r2c4, r2c5 = st.columns([1,1,1,.8,.9])
 with r2c1:
@@ -463,10 +387,10 @@ with r2c5:
                      "d_vat_pct":"vat_pct","d_broker":"broker","d_dray":"dray"}.items():
             st.session_state[k] = p[v]
         st.session_state["d_fx_note"] = p["note"]
-        st.success("Preset applied."); st.rerun()
+        st.rerun()
 st.markdown("</div>", unsafe_allow_html=True)
 
-# --------------- Trade data (UN Comtrade) ---------------
+# ---------- trade data ----------
 df = fetch_comtrade(reporter=reporter, flow=flow_code, years=years, hs=hs_val)
 period  = pick_col(df, ["period","yr","Time"])
 partner = pick_col(df, ["ptTitle","partner","Partner"], fill="World")
@@ -484,10 +408,8 @@ else:
     }).dropna(subset=["year","value_usd"]).fillna(0)
 
 trend = ndf.groupby("year")["value_usd"].sum().reset_index() if not ndf.empty else pd.DataFrame(columns=["year","value_usd"])
-partners_df = (ndf.groupby("partner")["value_usd"].sum()
-               .reset_index().sort_values("value_usd", ascending=False)) if not ndf.empty else pd.DataFrame(columns=["partner","value_usd"])
-unit_vals = (ndf.groupby("year").apply(lambda g: (g["value_usd"].sum() / max(1.0, g["kg"].sum())))
-             .reset_index(name="usd_per_kg")) if not ndf.empty else pd.DataFrame(columns=["year","usd_per_kg"])
+partners_df = (ndf.groupby("partner")["value_usd"].sum().reset_index().sort_values("value_usd", ascending=False)) if not ndf.empty else pd.DataFrame(columns=["partner","value_usd"])
+unit_vals = (ndf.groupby("year").apply(lambda g: (g["value_usd"].sum() / max(1.0, g["kg"].sum()))).reset_index(name="usd_per_kg")) if not ndf.empty else pd.DataFrame(columns=["year","usd_per_kg"])
 
 total_trade = float(trend["value_usd"].sum()) if not trend.empty else 0.0
 _top = partners_df.iloc[0] if not partners_df.empty else pd.Series({"partner":"—","value_usd":0})
@@ -504,67 +426,50 @@ if len(years_sorted) >= 2:
     yoy = float(np.mean(diffs)) if diffs else 0.0
     cagr_val = cagr(first, last, len(years_sorted)-1)
 
-# --------------- Route / distance / lead time ---------------
+# ---------- route ----------
 o_pt = geocode_point(origin_q); d_pt = geocode_point(dest_q)
 dist_km = None; lead_time_days = 0.0
 if o_pt and d_pt:
     a, b = (o_pt[0], o_pt[1]), (d_pt[0], d_pt[1])
     dist_km = float(haversine_km(a, b))
-    speed = 800 if mode == "Air" else (35*24 if mode == "Sea" else 60)  # km/h; sea ~ ship/day proxy
-    handling = 0.8 if mode == "Air" else (1.5 if mode == "Sea" else 0.2)
-    clearance = 0.8 if mode == "Air" else (2.0 if mode == "Sea" else 0.5)
-    local = 0.3 if mode == "Air" else (0.5 if mode == "Sea" else 0.2)
+    speed = 800 if mode == "Air" else (35*24 if mode == "Sea" else 60)
+    handling, clearance, local = (0.8,0.8,0.3) if mode=="Air" else ((1.5,2.0,0.5) if mode=="Sea" else (0.2,0.5,0.2))
     lead_time_days = (dist_km / speed) / 24 + handling + clearance + local
 
-# Emission factors (g CO2e per tonne-km; educational)
-EF = {"Air": 600.0, "Sea": 15.0, "Road": 120.0}
+EF = {"Air":600.0, "Sea":15.0, "Road":120.0}
 
-# --------------- KPI row ---------------
+# ---------- KPIs ----------
 st.markdown('<div class="kpi">', unsafe_allow_html=True)
 st.markdown(f'<div class="box"><p>Total Trade (USD)</p><h3>{total_trade:,.0f}</h3></div>', unsafe_allow_html=True)
 st.markdown(f'<div class="box"><p>Top Partner</p><h3>{_top["partner"]} ({float(_top["value_usd"]):,.0f})</h3></div>', unsafe_allow_html=True)
 st.markdown(f'<div class="box"><p># Partners</p><h3>{partners_df.shape[0]}</h3></div>', unsafe_allow_html=True)
 st.markdown(f'<div class="box"><p>Avg YoY Growth</p><h3>{yoy*100:.1f}%</h3></div>', unsafe_allow_html=True)
 st.markdown(f'<div class="box"><p>CAGR (period)</p><h3>{cagr_val*100:.1f}%</h3></div>', unsafe_allow_html=True)
-st.markdown(f'<div class="box"><p>FX USD→LKR</p><h3>{(fx_use or 0):.2f}</h3></div>', unsafe_allow_html=True)
+st.markdown(f'<div class="box"><p>FX USD→LKR</p><h3>{fx_use:.2f}</h3></div>', unsafe_allow_html=True)
 st.markdown('</div>', unsafe_allow_html=True)
 
-# --------------- LIVE SIGNALS tiles ---------------
+# ---------- LIVE SIGNALS (now cargo-focused) ----------
 tile1, tile2, tile3, tile4 = st.columns(4)
 with tile1:
     if o_pt and d_pt and mode == "Road":
         secs = best_live_road_eta((o_pt[0], o_pt[1]), (d_pt[0], d_pt[1]))
-        if secs:
-            st.metric("🚦 Road ETA (traffic)", f"{secs/3600:.1f} h")
-        else:
-            st.caption("Add GOOGLE_MAPS_KEY or HERE_API_KEY for traffic ETA")
-    else:
-        st.caption("Set Mode=Road to enable traffic ETA")
-
+        if secs: st.metric("🚦 Road ETA (traffic)", f"{secs/3600:.1f} h")
 with tile2:
     oiata = parse_iata(origin_q)
     if oiata and get_secret("AERODATABOX_KEY"):
-        deps = aerodatabox_departures(oiata, limit=5)
-        st.metric("🛫 Origin departures (now)", str(len(deps)) if not deps.empty else "0")
-    else:
-        st.caption("Add AERODATABOX_KEY; use origin like 'City IATA'")
-
+        deps_cargo = aerodatabox_departures_cargo(oiata, limit=5)
+        st.metric("🛫 Cargo departures (origin)", str(len(deps_cargo)) if not deps_cargo.empty else "0")
 with tile3:
     diata = parse_iata(dest_q)
     if diata and get_secret("AERODATABOX_KEY"):
-        arrs = aerodatabox_arrivals(diata, limit=5)
-        st.metric("🛬 Dest arrivals (now)", str(len(arrs)) if not arrs.empty else "0")
-    else:
-        st.caption("Add AERODATABOX_KEY; use dest like 'City IATA'")
-
+        arrs_cargo = aerodatabox_arrivals_cargo(diata, limit=5)
+        st.metric("🛬 Cargo arrivals (dest)", str(len(arrs_cargo)) if not arrs_cargo.empty else "0")
 with tile4:
     if d_pt and get_secret("MARINETRAFFIC_KEY"):
-        mt = marinetraffic_bbox(d_pt[0], d_pt[1], box_km=30)
-        st.metric("⚓ Vessels near destination", str(len(mt)) if not mt.empty else "0")
-    else:
-        st.caption("Add MARINETRAFFIC_KEY for AIS near port")
+        mt_cargo = marinetraffic_cargo_bbox(d_pt[0], d_pt[1], box_km=30)
+        st.metric("⚓ Cargo vessels near dest", str(len(mt_cargo)) if not mt_cargo.empty else "0")
 
-# --------------- Charts + Map/Live block ---------------
+# ---------- charts + map ----------
 left, right = st.columns([1.12, .88], gap="small")
 
 with left:
@@ -586,66 +491,51 @@ with left:
     st.markdown("</div>", unsafe_allow_html=True)
 
 with right:
-    st.markdown("<div class='card'><b>Route • Lead Time • Weather • Live boards • AIS • Emissions</b>", unsafe_allow_html=True)
+    st.markdown("<div class='card'><b>Route • Lead Time • Weather • Cargo Boards • Cargo AIS • Emissions</b>", unsafe_allow_html=True)
     w1, w2 = st.columns(2)
     with w1:
         ship_kg = st.number_input("Shipment weight (kg)", min_value=0.0, value=200.0, step=10.0, key="w_shipkg")
     with w2:
         temp_ctrl = st.checkbox("Temperature-controlled (cold chain)", value=True, key="w_cold")
 
-    # Map
     if o_pt and d_pt:
         fmap = folium.Map(location=[(o_pt[0]+d_pt[0])/2, (o_pt[1]+d_pt[1])/2], zoom_start=4, control_scale=True)
         folium.Marker((o_pt[0], o_pt[1]), tooltip=f"Origin: {origin_q}").add_to(fmap)
         folium.Marker((d_pt[0], d_pt[1]), tooltip=f"Destination: {dest_q}").add_to(fmap)
-        # Simple great-circle polyline (we keep it; traffic-polyline would require a different routing API)
         folium.PolyLine([(o_pt[0], o_pt[1]), (d_pt[0], d_pt[1])], color="#2563eb", weight=4).add_to(fmap)
         st_folium(fmap, height=420, use_container_width=True)
 
-        # Lead time + weather
         st.caption(f"Distance ≈ { (0 if dist_km is None else dist_km):,.0f} km • Estimated lead time: {lead_time_days:.1f} days ({mode})")
         ow = fetch_weather(o_pt[0], o_pt[1]); dw = fetch_weather(d_pt[0], d_pt[1])
         orisk, omsg = weather_risk(ow); drisk, dmsg = weather_risk(dw)
         st.write(f"🌤️ Origin weather risk: **{orisk}** ({omsg}) · Destination: **{drisk}** ({dmsg})")
 
-        # Live Road ETA (detail)
         if mode == "Road":
             secs_live = best_live_road_eta((o_pt[0], o_pt[1]), (d_pt[0], d_pt[1]))
-            if secs_live:
-                st.write(f"🚚 **Live road ETA (traffic)**: ~{secs_live/3600:.1f} h")
+            if secs_live: st.write(f"🚚 **Live road ETA (traffic)**: ~{secs_live/3600:.1f} h")
 
-        # AeroDataBox boards
         oiata = parse_iata(origin_q); diata = parse_iata(dest_q)
         if get_secret("AERODATABOX_KEY") and (oiata or diata):
-            with st.expander("✈️ Live airport boards (AeroDataBox)"):
+            with st.expander("✈️ Cargo flight boards (AeroDataBox)"):
                 ac1, ac2 = st.columns(2)
                 with ac1:
-                    st.caption(f"Origin departures — {oiata or 'unknown'}")
-                    deps = aerodatabox_departures(oiata, limit=10) if oiata else pd.DataFrame()
-                    st.dataframe(deps, use_container_width=True, height=240) if not deps.empty else st.info("No data / key not authorized")
+                    st.caption(f"Origin cargo departures — {oiata or '—'}")
+                    deps = aerodatabox_departures_cargo(oiata, limit=10) if oiata else pd.DataFrame()
+                    if not deps.empty: st.dataframe(deps, use_container_width=True, height=240)
                 with ac2:
-                    st.caption(f"Destination arrivals — {diata or 'unknown'}")
-                    arrs = aerodatabox_arrivals(diata, limit=10) if diata else pd.DataFrame()
-                    st.dataframe(arrs, use_container_width=True, height=240) if not arrs.empty else st.info("No data / key not authorized")
-        else:
-            st.caption("Tip: add AERODATABOX_KEY (RapidAPI) and use IATA codes in Origin/Dest (e.g., 'Colombo CMB').")
+                    st.caption(f"Destination cargo arrivals — {diata or '—'}")
+                    arrs = aerodatabox_arrivals_cargo(diata, limit=10) if diata else pd.DataFrame()
+                    if not arrs.empty: st.dataframe(arrs, use_container_width=True, height=240)
 
-        # MarineTraffic AIS near destination
         if d_pt and get_secret("MARINETRAFFIC_KEY"):
-            with st.expander("🚢 AIS vessels near destination (MarineTraffic)"):
-                mt = marinetraffic_bbox(d_pt[0], d_pt[1], box_km=30)
-                if not mt.empty:
-                    st.dataframe(mt[["shipname","type","speed_kn","course","ts"]], use_container_width=True, height=260)
-                    st.caption("Bounding box ~30 km around destination; timespan ~20 min.")
-                else:
-                    st.info("No AIS in box or plan not authorized.")
-        else:
-            st.caption("Tip: add MARINETRAFFIC_KEY to enable AIS near port.")
+            with st.expander("🚢 Cargo vessels near destination (MarineTraffic)"):
+                mtc = marinetraffic_cargo_bbox(d_pt[0], d_pt[1], box_km=30)
+                if not mtc.empty:
+                    st.dataframe(mtc[["shipname","type","speed_kn","course","ts"]], use_container_width=True, height=260)
+                    st.caption("AIS window ~20 min; bbox ~30 km around destination.")
 
-        # Emissions calc
         tonnes = (ship_kg or 0) / 1000.0
-        ef = EF.get(mode, 120.0)
-        co2e_kg = (dist_km or 0) * tonnes * (ef / 1000.0)
+        co2e_kg = (dist_km or 0) * tonnes * (EF.get(mode,120.0) / 1000.0)
         st.metric("Estimated emissions (kg CO₂e)", f"{co2e_kg:,.0f}")
         if temp_ctrl and lead_time_days and lead_time_days > 3 and mode != "Air":
             st.markdown("<div class='warn'>⚠️ Cold chain risk: long lead time. Consider passive packaging upgrades or Air.</div>", unsafe_allow_html=True)
@@ -655,7 +545,7 @@ with right:
 
 st.markdown("<hr class='soft'/>", unsafe_allow_html=True)
 
-# --------------- Landed Cost & Sensitivity ---------------
+# ---------- landed cost ----------
 st.markdown("<div class='card'><b>Landed Cost • Sensitivity</b>", unsafe_allow_html=True)
 lc1, lc2, lc3, lc4 = st.columns([1,1,1,.9])
 with lc1:
@@ -664,8 +554,7 @@ with lc1:
     fob = st.number_input("FOB value (USD)", min_value=0.0, value=st.session_state["d_fob"], step=100.0, key="w_fob")
     insurance_pct = st.number_input("Insurance %", min_value=0.0, value=st.session_state["d_ins_pct"], step=0.1, key="w_ins_pct")
 with lc2:
-    ins_base = st.selectbox("Insurance base", ["FOB","CIF"],
-                            index=["FOB","CIF"].index(st.session_state["d_ins_base"]), key="w_ins_base")
+    ins_base = st.selectbox("Insurance base", ["FOB","CIF"], index=["FOB","CIF"].index(st.session_state["d_ins_base"]), key="w_ins_base")
     freight = st.number_input("Freight (USD)", min_value=0.0, value=st.session_state["d_freight"], step=50.0, key="w_freight")
     broker = st.number_input("Brokerage & Handling (USD)", min_value=0.0, value=st.session_state["d_broker"], step=10.0, key="w_broker")
 with lc3:
@@ -703,7 +592,7 @@ with m6:
     if lead_time_days: st.caption(f"Lead time est. {lead_time_days:.1f} days ({mode}).")
 st.markdown("</div>", unsafe_allow_html=True)
 
-# --------------- Origin Compare ---------------
+# ---------- origin compare ----------
 st.markdown("<div class='card'><b>Compare Origins (What-if)</b>", unsafe_allow_html=True)
 comp_df = pd.DataFrame([
     {"Origin":"India",    "FOB": fob,          "Freight": 2500, "Duty%": 0.0},
@@ -720,7 +609,7 @@ if px is not None: st.plotly_chart(px.bar(out, x="Origin", y="TLC_USD", title="T
 else: st.bar_chart(out.set_index("Origin")["TLC_USD"])
 st.markdown("</div>", unsafe_allow_html=True)
 
-# --------------- Guides / Packing ---------------
+# ---------- guides / packing ----------
 boxL, boxR = st.columns([1.05, .95], gap="small")
 with boxL:
     st.markdown("<div class='card'>", unsafe_allow_html=True)
@@ -768,15 +657,14 @@ with boxR:
         else: st.bar_chart(pk_df.set_index("Unit")["Max cartons"])
     st.markdown("</div>", unsafe_allow_html=True)
 
-# --------------- Save / Compare Scenarios ---------------
+# ---------- scenarios ----------
 st.markdown("<div class='card'><b>Save & Compare Scenarios</b>", unsafe_allow_html=True)
 sc1, sc2 = st.columns([.44,.56])
 with sc1:
     scenario_name = st.text_input("Scenario name", value="My scenario")
     if st.button("Save this scenario"):
         entry = {
-            "name": scenario_name,
-            "hs": hs_val, "reporter": reporter_name, "flow": flow, "years": years,
+            "name": scenario_name, "hs": hs_val, "reporter": reporter_name, "flow": flow, "years": years,
             "mode": mode, "origin": origin_q, "dest": dest_q, "dist_km": dist_km,
             "incoterm": incoterm, "fob": fob, "freight": freight, "insurance_pct": insurance_pct,
             "ins_base": ins_base, "duty_pct": duty_pct, "vat_pct": vat_pct, "broker": broker, "dray": dray,
@@ -799,7 +687,7 @@ with sc2:
         st.info("No saved scenarios yet.")
 st.markdown("</div>", unsafe_allow_html=True)
 
-# --------------- Export snapshot ---------------
+# ---------- export snapshot ----------
 exp = {
     "hs": hs_val, "reporter": reporter_name, "flow": flow, "years": years,
     "fx_rate_usd_lkr": fx_use*(1+st.session_state.get("w_fx_shock",0)/100),
@@ -817,7 +705,6 @@ if not trend.empty:
 if not partners_df.empty:
     for _, r in partners_df.head(10).iterrows(): row[f"partner_{r.partner}"] = float(r.value_usd)
 row["tlc_usd"] = res["total"]; row["cif"] = res["cif"]; row["duty"] = res["duty"]; row["vat"] = res["vat"]
-
 csv_buf = io.StringIO(); pd.DataFrame([row]).to_csv(csv_buf, index=False)
 dl1, dl2 = st.columns(2)
 with dl1: st.download_button("Download scenario CSV", data=csv_buf.getvalue(), file_name="gtm_scenario.csv", mime="text/csv")
