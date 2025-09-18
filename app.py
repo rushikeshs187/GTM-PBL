@@ -1,30 +1,30 @@
 # GTM Global Trade & Logistics Dashboard (Sri Lanka focus)
-# Product default: HS 3004.31 (pre‑filled insulin pens) — but supports any HS-6 code
+# Product default: HS 3004.31 (pre-filled insulin pens) — supports any HS-6 code
 # Features:
 # - Live UN Comtrade+ data (imports/exports) with trend, partners, unit values
-# - FX via exchangerate.host (USD→LKR, EUR)
+# - FX via exchangerate.host (USD→LKR, EUR) with override
 # - In-depth landed cost calculator (Incoterms, insurance base, duty/VAT, brokerage, drayage)
-# - Scenario analysis (freight shock, tariff shock, FX override)
+# - Scenario analysis (freight shock, tariff shock)
+# - Multi-origin comparison (e.g., India vs Denmark vs Singapore)
 # - Routes & mapping (folium) with geocoding (Nominatim)
-# - Multi-origin comparison (e.g., India vs Denmark vs EU)
-# - Downloadable CSV of results & figures
+# - Downloadable CSV/JSON of scenarios + requirements.txt helper
+# - Presets (Insulin pens, Pharma APIs, Medical devices)
+# - Tariff & NTM helper links (MACMAP, TradeMap, SL Customs)
+# - Packing / ULD & Container capacity calculator
 
-import os
 import io
-import time
 import json
 import math
+from datetime import datetime
 import requests
 import pandas as pd
 import numpy as np
 import plotly.express as px
-import plotly.graph_objects as go
 import streamlit as st
-from datetime import datetime
-from geopy.geocoders import Nominatim
-from geopy.extra.rate_limiter import RateLimiter
 import folium
 from streamlit_folium import st_folium
+from geopy.geocoders import Nominatim
+from geopy.extra.rate_limiter import RateLimiter
 
 # ------------------------
 # App config & minimal styling
@@ -37,7 +37,6 @@ st.set_page_config(
 
 CSS = """
 <style>
-/***** polish *****/
 section.main > div {padding-top: 1rem !important}
 .small {font-size: 0.85rem; color: #7b8794}
 .kpi {display:grid; grid-template-columns: repeat(5, minmax(0,1fr)); gap: .5rem}
@@ -55,6 +54,7 @@ st.markdown(CSS, unsafe_allow_html=True)
 UN_COMTRADE_BASE = "https://comtradeplus.un.org/api/get"
 FX_URL = "https://api.exchangerate.host/latest"
 DEFAULT_HS = "300431"  # insulin pens (retail)
+
 REPORTERS = {
     "Sri Lanka (144)": "144",
     "India (356)": "356",
@@ -63,6 +63,44 @@ REPORTERS = {
     "Singapore (702)": "702",
     "World (000)": "0",
 }
+
+# Presets
+PRESETS = {
+    "Insulin pens (retail) — HS 300431": {
+        "hs": "300431", "incoterm": "CIF", "fob": 20000.0, "freight": 2500.0, "insurance_pct": 1.0,
+        "ins_base": "FOB", "duty_pct": 0.0, "vat_pct": 8.0, "broker": 300.0, "dray": 120.0,
+        "note": "ISFTA concession likely for India→Sri Lanka pharma (verify on MACMAP)."
+    },
+    "Pharma APIs (bulk) — HS 293721 (example)": {
+        "hs": "293721", "incoterm": "FOB", "fob": 35000.0, "freight": 1800.0, "insurance_pct": 0.6,
+        "ins_base": "FOB", "duty_pct": 2.0, "vat_pct": 8.0, "broker": 350.0, "dray": 150.0,
+        "note": "APIs may have different tariff lines/NTMs; confirm exact subheading on MACMAP."
+    },
+    "Medical devices (misc.) — HS 901890 (example)": {
+        "hs": "901890", "incoterm": "CIF", "fob": 25000.0, "freight": 3200.0, "insurance_pct": 1.0,
+        "ins_base": "CIF", "duty_pct": 5.0, "vat_pct": 8.0, "broker": 320.0, "dray": 140.0,
+        "note": "Devices can face MFN duties unless FTA/GSP applies; check serial/UDI requirements."
+    },
+}
+
+def init_state():
+    defaults = {
+        "hs": DEFAULT_HS,
+        "incoterm": "CIF",
+        "fob": 20000.0,
+        "freight": 2500.0,
+        "insurance_pct": 1.0,
+        "ins_base": "FOB",
+        "duty_pct": 0.0,
+        "vat_pct": 8.0,
+        "broker": 300.0,
+        "dray": 120.0,
+        "fx_note": "ISFTA concession may apply — verify on MACMAP",
+    }
+    for k, v in defaults.items():
+        st.session_state.setdefault(k, v)
+
+init_state()
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def fetch_fx(base="USD", symbols=("LKR","EUR")):
@@ -93,7 +131,7 @@ def fetch_comtrade(reporter="144", flow="1", years="2019,2020,2021,2022,2023", h
         j = r.json()
         ds = j.get("dataset", [])
         return pd.DataFrame(ds)
-    except Exception as e:
+    except Exception:
         # Fallback demo data
         data = [
             {"period":2019,"ptTitle":"India","TradeValue":12000000,"NetWeight":100000,"Qty":10000},
@@ -109,30 +147,34 @@ def fetch_comtrade(reporter="144", flow="1", years="2019,2020,2021,2022,2023", h
         ]
         return pd.DataFrame(data)
 
-# Geocoder with rate limiting (Nominatim requires a custom UA)
+# Geocoder (Nominatim) with rate limiting
 geolocator = Nominatim(user_agent="gtm_dashboard/1.0 (edu)")
 geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1, swallow_exceptions=True)
 
 # ------------------------
-# UI — Sidebar controls
+# UI — Header & Sidebar
 # ------------------------
 st.title("GTM Global Trade & Logistics Dashboard — Sri Lanka Focus")
-st.caption("Live trade (UN Comtrade), FX, landed cost, routes & mapping • HS‑code explorer • Designed for coursework")
+st.caption("Live trade (UN Comtrade), FX, landed cost, routes & mapping • HS-code explorer • Designed for coursework")
 
 with st.sidebar:
     st.header("Filters & Settings")
-    hs = st.text_input("HS code (6‑digit)", value=DEFAULT_HS, help="Example: 300431 (Insulin pens)")
+
+    # HS & Reporter/Years
+    st.session_state["hs"] = st.text_input("HS code (6-digit)", value=st.session_state["hs"], key="hs")
     reporter_name = st.selectbox("Reporter (analysis country)", list(REPORTERS.keys()), index=0)
     reporter = REPORTERS[reporter_name]
     flow = st.radio("Trade flow", ["Imports","Exports"], horizontal=True)
     flow_code = "1" if flow == "Imports" else "2"
     years = st.selectbox("Years", ["2019,2020,2021,2022,2023","2020,2021,2022,2023,2024","2018,2019,2020,2021,2022"], index=0)
+
     st.divider()
     st.write("**FX Settings**")
-    fx = fetch_fx()
-    fx_override = st.number_input("USD→LKR override (optional)", min_value=0.0, step=0.01, value=0.0, help="Leave 0 for liveFX")
-    fx_rate = fx_override if fx_override>0 else float(fx.get("LKR", 0) or 0)
+    fx_live = fetch_fx()
+    fx_override = st.number_input("USD→LKR override (optional)", min_value=0.0, step=0.01, value=0.0, help="Leave 0 for live FX")
+    fx_rate = fx_override if fx_override > 0 else float(fx_live.get("LKR", 0) or 0)
     st.caption(f"Live FX USD→LKR: {fx_rate:.2f}" if fx_rate else "FX offline — using overrides or USD")
+
     st.divider()
     st.write("**Route Planner**")
     origin_q = st.text_input("Origin city/airport/port", value="Bengaluru BLR")
@@ -143,9 +185,8 @@ with st.sidebar:
 # ------------------------
 # Fetch & transform trade data
 # ------------------------
-df = fetch_comtrade(reporter=reporter, flow=flow_code, years=years, hs=hs)
+df = fetch_comtrade(reporter=reporter, flow=flow_code, years=years, hs=st.session_state["hs"])
 
-# Normalize columns safely
 period = df.get("period") or df.get("yr") or df.get("Time")
 partner = df.get("ptTitle") or df.get("partner") or df.get("Partner")
 value = df.get("TradeValue") or df.get("PrimaryValue") or df.get("value")
@@ -173,23 +214,24 @@ if len(years_sorted) >= 2:
         prev = float(trend.loc[trend["year"]==years_sorted[i-1], "value_usd"].values[0])
         cur = float(trend.loc[trend["year"]==years_sorted[i], "value_usd"].values[0])
         growths.append((cur - prev) / max(1.0, prev))
-    yoy = np.mean(growths)
+    yoy = float(np.mean(growths))
 
 # ------------------------
 # Layout: KPIs
 # ------------------------
-col = st.container()
-with col:
+kpi = st.container()
+with kpi:
     st.markdown('<div class="kpi">', unsafe_allow_html=True)
     st.markdown(f'<div class="box"><p>Total Trade (USD)</p><h3>{total_trade:,.0f}</h3></div>', unsafe_allow_html=True)
     st.markdown(f'<div class="box"><p>Top Partner</p><h3>{_top["partner"]} ({_top["value_usd"]:,.0f})</h3></div>', unsafe_allow_html=True)
     st.markdown(f'<div class="box"><p># Partners</p><h3>{partners.shape[0]}</h3></div>', unsafe_allow_html=True)
     st.markdown(f'<div class="box"><p>Avg YoY Growth</p><h3>{yoy*100:.1f}%</h3></div>', unsafe_allow_html=True)
-    st.markdown(f'<div class="box"><p>FX USD→LKR</p><h3>{fx_rate:.2f if fx_rate else 0}</h3></div>', unsafe_allow_html=True)
+    fx_display = f"{fx_rate:.2f}" if fx_rate else "0"
+    st.markdown(f'<div class="box"><p>FX USD→LKR</p><h3>{fx_display}</h3></div>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
 # ------------------------
-# Tabs: Trend / Partners / Unit values
+# Tabs: Trend / Partners / Unit values / Data
 # ------------------------
 t1, t2, t3, t4 = st.tabs(["Trend","Partner Share","Unit Values","Data Table"])
 
@@ -204,8 +246,8 @@ with t2:
     if not partners.empty:
         fig = px.bar(partners.head(12), x="value_usd", y="partner", orientation="h", title="Top Partners (USD)")
         st.plotly_chart(fig, use_container_width=True)
-        st.caption("Tip: click a partner below to auto-route from that country (best-effort geocode).")
-        sel = st.dataframe(partners.head(25), use_container_width=True)
+        st.caption("Tip: Use the Route Planner to map from a partner country’s main gateway.")
+        st.dataframe(partners.head(25), use_container_width=True)
     else:
         st.info("No partner data.")
 
@@ -218,7 +260,6 @@ with t3:
 
 with t4:
     st.dataframe(ndf, use_container_width=True)
-    # download raw
     buf = io.StringIO()
     ndf.to_csv(buf, index=False)
     st.download_button("Download raw dataset (CSV)", data=buf.getvalue(), file_name="trade_raw.csv", mime="text/csv")
@@ -228,9 +269,11 @@ with t4:
 # ------------------------
 @st.cache_data(show_spinner=False)
 def geocode_point(q: str):
-    if not q: return None
+    if not q:
+        return None
     loc = geocode(q)
-    if not loc: return None
+    if not loc:
+        return None
     return (loc.latitude, loc.longitude, loc.address)
 
 @st.cache_data(show_spinner=False)
@@ -244,8 +287,6 @@ def haversine_km(a, b):
     return 2 * R * np.arcsin(np.sqrt(h))
 
 lead_time_days = 0.0
-origin_pt = None
-dest_pt = None
 if plot_route:
     origin_pt = geocode_point(origin_q)
     dest_pt = geocode_point(dest_q)
@@ -253,10 +294,10 @@ if plot_route:
         o = (origin_pt[0], origin_pt[1])
         d = (dest_pt[0], dest_pt[1])
         dist_km = float(haversine_km(o, d))
-        speed = 800 if mode=="Air" else (35*24 if mode=="Sea" else 60)  # km/h
-        handling = 0.8 if mode=="Air" else (1.5 if mode=="Sea" else 0.2)
-        clearance = 0.8 if mode=="Air" else (2.0 if mode=="Sea" else 0.5)
-        local = 0.3 if mode=="Air" else (0.5 if mode=="Sea" else 0.2)
+        speed = 800 if mode == "Air" else (35*24 if mode == "Sea" else 60)  # km/h
+        handling = 0.8 if mode == "Air" else (1.5 if mode == "Sea" else 0.2)
+        clearance = 0.8 if mode == "Air" else (2.0 if mode == "Sea" else 0.5)
+        local = 0.3 if mode == "Air" else (0.5 if mode == "Sea" else 0.2)
         lead_time_days = (dist_km / speed) / 24 + handling + clearance + local
 
         fmap = folium.Map(location=[(o[0]+d[0])/2, (o[1]+d[1])/2], zoom_start=4, control_scale=True)
@@ -269,33 +310,31 @@ if plot_route:
         st.warning("Could not geocode one or both locations. Try a clearer query (e.g., 'Bengaluru BLR', 'Colombo CMB').")
 
 # ------------------------
-# Landed cost calculator (multi‑origin compare)
+# Landed cost calculator (multi-origin compare)
 # ------------------------
-st.subheader("In‑Depth Landed Cost Calculator & Scenario Analysis")
+st.subheader("In-Depth Landed Cost Calculator & Scenario Analysis")
 
 with st.expander("Assumptions & Inputs", expanded=True):
     c1, c2, c3 = st.columns(3)
     with c1:
-        incoterm = st.selectbox("Incoterm", ["FOB","CIF","DAP","DDP"], index=1)
-        fob = st.number_input("FOB value (per shipment, USD)", min_value=0.0, value=20000.0, step=100.0)
-        insurance_pct = st.number_input("Insurance %", min_value=0.0, value=1.0, step=0.1)
-        ins_base = st.selectbox("Insurance base", ["FOB","CIF"], index=0)
+        st.session_state["incoterm"] = st.selectbox("Incoterm", ["FOB","CIF","DAP","DDP"], index=["FOB","CIF","DAP","DDP"].index(st.session_state["incoterm"]))
+        st.session_state["fob"] = st.number_input("FOB value (per shipment, USD)", min_value=0.0, value=st.session_state["fob"], step=100.0)
+        st.session_state["insurance_pct"] = st.number_input("Insurance %", min_value=0.0, value=st.session_state["insurance_pct"], step=0.1)
+        st.session_state["ins_base"] = st.selectbox("Insurance base", ["FOB","CIF"], index=["FOB","CIF"].index(st.session_state["ins_base"]))
     with c2:
-        freight = st.number_input("Freight (base, USD)", min_value=0.0, value=2500.0, step=50.0)
-        broker = st.number_input("Brokerage & Handling (USD)", min_value=0.0, value=300.0, step=10.0)
-        dray = st.number_input("Last‑mile / Drayage (USD)", min_value=0.0, value=120.0, step=10.0)
-        vat_pct = st.number_input("VAT / GST %", min_value=0.0, value=8.0, step=0.5)
+        st.session_state["freight"] = st.number_input("Freight (base, USD)", min_value=0.0, value=st.session_state["freight"], step=50.0)
+        st.session_state["broker"] = st.number_input("Brokerage & Handling (USD)", min_value=0.0, value=st.session_state["broker"], step=10.0)
+        st.session_state["dray"] = st.number_input("Last-mile / Drayage (USD)", min_value=0.0, value=st.session_state["dray"], step=10.0)
+        st.session_state["vat_pct"] = st.number_input("VAT / GST %", min_value=0.0, value=st.session_state["vat_pct"], step=0.5)
     with c3:
-        duty_pct = st.number_input("Duty %", min_value=0.0, value=0.0, step=0.5)
+        st.session_state["duty_pct"] = st.number_input("Duty %", min_value=0.0, value=st.session_state["duty_pct"], step=0.5)
         shock_freight = st.slider("Freight shock %", 0, 200, 0)
         shock_tariff = st.slider("Tariff shock (Δ duty %)", 0, 20, 0)
-        fx_note = st.text_input("Notes (FTA/GSP refs)", value="ISFTA concession for pharma may apply (verify on MACMAP)")
-
-# Cost engine
+        st.session_state["fx_note"] = st.text_input("Notes (FTA/GSP refs)", value=st.session_state["fx_note"])
 
 def landed_cost(fob, freight, insurance_pct, ins_base, duty_pct, vat_pct, broker, dray, shock_freight, incoterm):
     freight_final = freight * (1 + shock_freight/100)
-    ins_base_val = fob if ins_base=="FOB" else (fob + freight_final)
+    ins_base_val = fob if ins_base == "FOB" else (fob + freight_final)
     insurance = ins_base_val * (insurance_pct/100)
     cif = fob + freight_final + insurance
     duty = cif * (duty_pct/100)
@@ -305,7 +344,7 @@ def landed_cost(fob, freight, insurance_pct, ins_base, duty_pct, vat_pct, broker
     total = taxable + vat + broker + dray
     if incoterm == "FOB":
         total = fob + freight_final + insurance + duty + vat + broker + dray
-    # DAP/DDP: nuanced allocation — here we show buyer outlay; can be adjusted per contract.
+    # DAP/DDP: nuanced allocation (kept as buyer outlay for visualization)
     return {
         "freight_final": freight_final,
         "insurance": insurance,
@@ -316,16 +355,16 @@ def landed_cost(fob, freight, insurance_pct, ins_base, duty_pct, vat_pct, broker
     }
 
 res = landed_cost(
-    fob=fob,
-    freight=freight,
-    insurance_pct=insurance_pct,
-    ins_base=ins_base,
-    duty_pct=duty_pct+shock_tariff,
-    vat_pct=vat_pct,
-    broker=broker,
-    dray=dray,
+    fob=st.session_state["fob"],
+    freight=st.session_state["freight"],
+    insurance_pct=st.session_state["insurance_pct"],
+    ins_base=st.session_state["ins_base"],
+    duty_pct=st.session_state["duty_pct"] + shock_tariff,
+    vat_pct=st.session_state["vat_pct"],
+    broker=st.session_state["broker"],
+    dray=st.session_state["dray"],
     shock_freight=shock_freight,
-    incoterm=incoterm,
+    incoterm=st.session_state["incoterm"],
 )
 
 cA, cB, cC, cD, cE, cF = st.columns(6)
@@ -336,26 +375,26 @@ with cD: st.metric("Duty", f"${res['duty']:,.0f}")
 with cE: st.metric("VAT", f"${res['vat']:,.0f}")
 with cF: st.metric("Total Landed Cost", f"${res['total']:,.0f}")
 
-# Multi‑origin comparison
-st.markdown("### Compare Origins (quick what‑if)")
+# Multi-origin comparison
+st.markdown("### Compare Origins (quick what-if)")
 comp_df = pd.DataFrame([
-    {"Origin":"India","FOB":fob, "Freight":2500, "Duty%":0.0},
-    {"Origin":"Denmark","FOB":fob*1.05, "Freight":5500, "Duty%":duty_pct or 2.0},
-    {"Origin":"Singapore","FOB":fob*1.02, "Freight":3200, "Duty%":duty_pct},
+    {"Origin": "India", "FOB": st.session_state["fob"], "Freight": 2500, "Duty%": 0.0},                 # ISFTA demo
+    {"Origin": "Denmark", "FOB": st.session_state["fob"]*1.05, "Freight": 5500, "Duty%": max(st.session_state["duty_pct"], 2.0)},
+    {"Origin": "Singapore", "FOB": st.session_state["fob"]*1.02, "Freight": 3200, "Duty%": st.session_state["duty_pct"]},
 ])
 rows = []
 for _, r in comp_df.iterrows():
     rr = landed_cost(
         fob=r.FOB,
         freight=r.Freight,
-        insurance_pct=insurance_pct,
-        ins_base=ins_base,
+        insurance_pct=st.session_state["insurance_pct"],
+        ins_base=st.session_state["ins_base"],
         duty_pct=r["Duty%"],
-        vat_pct=vat_pct,
-        broker=broker,
-        dray=dray,
+        vat_pct=st.session_state["vat_pct"],
+        broker=st.session_state["broker"],
+        dray=st.session_state["dray"],
         shock_freight=shock_freight,
-        incoterm=incoterm,
+        incoterm=st.session_state["incoterm"],
     )
     rows.append({"Origin": r.Origin, "TLC_USD": rr["total"], "CIF": rr["cif"], "Duty": rr["duty"], "VAT": rr["vat"]})
 comp_out = pd.DataFrame(rows)
@@ -365,66 +404,69 @@ st.plotly_chart(fig_comp, use_container_width=True)
 
 # Download assumptions & result
 exp = {
-    "hs": hs,
+    "hs": st.session_state["hs"],
     "reporter": reporter_name,
     "flow": flow,
     "years": years,
     "fx_rate_usd_lkr": fx_rate,
-    "route": {"origin": origin_q, "dest": dest_q, "mode": mode, "lead_time_days": round(lead_time_days,1)},
-    "inputs": {"incoterm": incoterm, "fob": fob, "freight": freight, "insurance_pct": insurance_pct, "ins_base": ins_base, "duty_pct": duty_pct, "vat_pct": vat_pct, "broker": broker, "dray": dray, "shock_freight": shock_freight, "shock_tariff": shock_tariff},
+    "route": {"origin": origin_q, "dest": dest_q, "mode": mode, "lead_time_days": round(lead_time_days, 1)},
+    "inputs": {
+        "incoterm": st.session_state["incoterm"],
+        "fob": st.session_state["fob"],
+        "freight": st.session_state["freight"],
+        "insurance_pct": st.session_state["insurance_pct"],
+        "ins_base": st.session_state["ins_base"],
+        "duty_pct": st.session_state["duty_pct"],
+        "vat_pct": st.session_state["vat_pct"],
+        "broker": st.session_state["broker"],
+        "dray": st.session_state["dray"],
+        "shock_freight": shock_freight,
+        "shock_tariff": shock_tariff,
+    },
     "outputs": res,
 }
 
 csv_buf = io.StringIO()
-pd.DataFrame([{
-    **exp["inputs"],
-    **{f"trend_{int(r.year)}": float(r.value_usd) for _, r in trend.iterrows()} if not trend.empty else {},
-    **{f"partner_{r.partner}": float(r.value_usd) for _, r in partners.head(10).iterrows()} if not partners.empty else {},
-    "tlc_usd": res["total"],
-    "cif": res["cif"],
-    "duty": res["duty"],
-    "vat": res["vat"],
-}]).to_csv(csv_buf, index=False)
+row = {}
+row.update(exp["inputs"])  # base inputs
 
-col1, col2 = st.columns([1,1])
+# add trend columns if available
+if not trend.empty:
+    for _, r in trend.iterrows():
+        row[f"trend_{int(r.year)}"] = float(r.value_usd)
+
+# add top partner columns if available
+if not partners.empty:
+    for _, r in partners.head(10).iterrows():
+        row[f"partner_{r.partner}"] = float(r.value_usd)
+
+# outputs
+row["tlc_usd"] = res["total"]
+row["cif"] = res["cif"]
+row["duty"] = res["duty"]
+row["vat"] = res["vat"]
+pd.DataFrame([row]).to_csv(csv_buf, index=False)
+
+col1, col2 = st.columns([1, 1])
 with col1:
     st.download_button("Download scenario CSV", data=csv_buf.getvalue(), file_name="gtm_scenario.csv", mime="text/csv")
 with col2:
     st.download_button("Download scenario JSON", data=json.dumps(exp, indent=2), file_name="gtm_scenario.json", mime="application/json")
 
 st.markdown("---")
-st.caption("Always verify tariffs/NTMs on official sources (e.g., MACMAP, SL Customs). This educational tool uses public APIs and simple lead‑time models.")
+st.caption("Always verify tariffs/NTMs on official sources (e.g., MACMAP, Sri Lanka Customs). Models here are educational.")
+
 # ------------------------
 # Presets, Tariff Helper, and Packing Calculator (NEW)
 # ------------------------
-
 st.markdown("---")
 st.header("Presets • Tariff Helper • Packing / ULD Calculator")
 
-# ---- Presets
-PRESETS = {
-    "Insulin pens (retail) — HS 300431": {
-        "hs": "300431", "incoterm": "CIF", "fob": 20000.0, "freight": 2500.0, "insurance_pct": 1.0,
-        "ins_base": "FOB", "duty_pct": 0.0, "vat_pct": 8.0, "broker": 300.0, "dray": 120.0,
-        "note": "ISFTA concession likely for India→Sri Lanka pharma (verify on MACMAP)."
-    },
-    "Pharma APIs (bulk) — HS 293721 (example)": {
-        "hs": "293721", "incoterm": "FOB", "fob": 35000.0, "freight": 1800.0, "insurance_pct": 0.6,
-        "ins_base": "FOB", "duty_pct": 2.0, "vat_pct": 8.0, "broker": 350.0, "dray": 150.0,
-        "note": "APIs may have different tariff lines / NTMs; confirm exact subheading on MACMAP."
-    },
-    "Medical devices (misc.) — HS 901890 (example)": {
-        "hs": "901890", "incoterm": "CIF", "fob": 25000.0, "freight": 3200.0, "insurance_pct": 1.0,
-        "ins_base": "CIF", "duty_pct": 5.0, "vat_pct": 8.0, "broker": 320.0, "dray": 140.0,
-        "note": "Devices can face MFN duties unless FTA/GSP applies; check serial/UDI requirements."
-    },
-}
-
-with st.expander("Preset selector (auto‑fill HS & cost inputs)", expanded=True):
+# ---- Preset selector
+with st.expander("Preset selector (auto-fill HS & cost inputs)", expanded=True):
     preset_name = st.selectbox("Choose a preset", list(PRESETS.keys()), index=0)
     if st.button("Apply preset"):
         p = PRESETS[preset_name]
-        # update UI state by rerunning with new defaults via session_state
         st.session_state["hs"] = p["hs"]
         st.session_state["incoterm"] = p["incoterm"]
         st.session_state["fob"] = p["fob"]
@@ -436,8 +478,8 @@ with st.expander("Preset selector (auto‑fill HS & cost inputs)", expanded=True
         st.session_state["broker"] = p["broker"]
         st.session_state["dray"] = p["dray"]
         st.session_state["fx_note"] = p["note"]
-        st.success("Preset applied — update your sidebar HS code and cost inputs if needed.")
-        st.stop()
+        st.success("Preset applied.")
+        st.rerun()
 
 # ---- Tariff helper
 with st.expander("Tariff & NTM helper (MACMAP / SL Customs)", expanded=True):
@@ -447,15 +489,15 @@ with st.expander("Tariff & NTM helper (MACMAP / SL Customs)", expanded=True):
         st.markdown("- 🧭 [MACMAP — Tariffs & Measures](https://www.macmap.org/)\n- 📊 [TradeMap — Flows](https://www.trademap.org/)\n- 🏛️ [Sri Lanka Customs](http://www.customs.gov.lk/)")
     with c2:
         st.markdown("**Context**")
-        st.write("Use HS‑6 to start, then drill to HS‑8/HS‑10 for exact national lines. Check ISFTA schedules for India→Sri Lanka.")
+        st.write("Use HS-6 to start, then drill to HS-8/HS-10 for exact national lines. Check ISFTA schedules for India→Sri Lanka.")
     with c3:
-        helper_hs = st.text_input("HS for lookup", value=st.session_state.get("hs", hs))
+        helper_hs = st.text_input("HS for lookup", value=st.session_state.get("hs", DEFAULT_HS))
         st.caption("Tip: confirm MFN vs FTA vs GSP+. Add notes below.")
     tariff_notes = st.text_area("Your tariff/NTM notes", value=st.session_state.get("fx_note", ""), height=120)
 
 # ---- Packing / ULD calculator
 with st.expander("Packing & ULD / Container calculator", expanded=True):
-    st.write("Estimate how many cartons fit on an air PMC pallet or in sea containers. Uses simple floor‑packing (no rotation).")
+    st.write("Estimate how many cartons fit on an air PMC pallet or in sea containers. Uses simple floor-packing (no rotation).")
     pc1, pc2, pc3 = st.columns(3)
     with pc1:
         carton_l = st.number_input("Carton length (cm)", 1.0, 200.0, 40.0)
@@ -469,7 +511,7 @@ with st.expander("Packing & ULD / Container calculator", expanded=True):
         use_pmc = st.checkbox("Air PMC pallet (243x318 cm) height 160 cm", value=True)
         use_20 = st.checkbox("Sea 20' (589x235x239 cm)", value=False)
         use_40 = st.checkbox("Sea 40' (1203x235x239 cm)", value=False)
-    
+
     def pack_on(base_l, base_w, base_h):
         per_row = math.floor(base_l // carton_l) * math.floor(base_w // carton_w)
         layers = math.floor((min(base_h, max_stack_h)) // (carton_h + layer_gap))
@@ -494,7 +536,7 @@ with st.expander("Packing & ULD / Container calculator", expanded=True):
         fig_pk = px.bar(pk_df, x="Unit", y="Max cartons", title="Packing capacity")
         st.plotly_chart(fig_pk, use_container_width=True)
 
-# ---- Offer requirements.txt content for deployment
+# ---- requirements.txt helper
 with st.expander("requirements.txt (download)", expanded=True):
     reqs = """
 streamlit
@@ -508,4 +550,3 @@ geopy
     """.strip()
     st.code(reqs, language="text")
     st.download_button("Download requirements.txt", data=reqs, file_name="requirements.txt")
-
