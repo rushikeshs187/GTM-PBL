@@ -1,13 +1,18 @@
 # app.py — GTM Global Trade & Logistics Dashboard (Sri Lanka Focus)
-# v2 — Precise Incoterms & Landed-Cost engine (EXW, FCA, FAS, FOB, CFR, CIF, CPT, CIP, DAP, DPU, DDP)
-# - Insurance: % or fixed amount; selectable base (Invoice or Invoice+Freight)
-# - Accurate customs value (CIF-equivalent) -> duty -> VAT; DDP logic (seller pays import taxes)
-# - Live signals: traffic ETA (Google/HERE), cargo flights (AeroDataBox), cargo AIS (MarineTraffic)
-# - Trade/FX/weather charts, packing, scenarios, exports
-# Secrets: GOOGLE_MAPS_KEY (opt), HERE_API_KEY (opt), AERODATABOX_KEY (opt), MARINETRAFFIC_KEY (opt)
+# v2.1 — KPI clarity + FX volatility + HERE traffic incidents
+# Features:
+# - UN Comtrade trade + charts
+# - FX live + 30d volatility sparkline
+# - Route, lead time, weather
+# - Live road ETA (Google/HERE)
+# - HERE traffic incidents on corridor (tile + table)
+# - AeroDataBox cargo flight boards (origin/dest)
+# - MarineTraffic cargo AIS near destination
+# - Precise Incoterms engine (EXW…DDP) with insurance %/amount, correct customs value & taxes
+# - Packing calculator, scenarios, exports
 
-import io, os, json, math
-from typing import Optional, Tuple
+import io, os, json, math, datetime as dt
+from typing import Optional, Tuple, List
 
 import requests, pandas as pd, numpy as np, streamlit as st
 import folium
@@ -42,7 +47,6 @@ def apply_css(theme="Light", compact=False):
         kpi_bg, kpi_bd, input_bg = "#0f172a", "#1e293b", "#0d1422"
 
     density = ".5rem .7rem" if compact else ".62rem .8rem"
-
     st.markdown(f"""
     <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap');
@@ -65,12 +69,10 @@ def apply_css(theme="Light", compact=False):
     </style>
     """, unsafe_allow_html=True)
 
-# defaults
 if "theme" not in st.session_state: st.session_state["theme"] = "Light"
 if "compact" not in st.session_state: st.session_state["compact"] = False
 apply_css(st.session_state["theme"], st.session_state["compact"])
 
-# style bar
 st.markdown("<div class='card'>", unsafe_allow_html=True)
 c1, c2, c3 = st.columns([.4,.4,.2])
 with c1:
@@ -88,6 +90,7 @@ st.markdown("</div>", unsafe_allow_html=True)
 # ========================= Data helpers =========================
 UN_COMTRADE = "https://comtradeplus.un.org/api/get"
 FX_URL      = "https://api.exchangerate.host/latest"
+FX_TS_URL   = "https://api.exchangerate.host/timeseries"
 WEATHER_API = "https://api.open-meteo.com/v1/forecast"
 
 REPORTERS = {
@@ -116,6 +119,26 @@ def fetch_fx(base="USD", symbols=("LKR","EUR")):
     except Exception:
         return {}
 
+@st.cache_data(show_spinner=False, ttl=1800)
+def fetch_fx_timeseries(base="USD", symbol="LKR", days=30):
+    end = dt.date.today()
+    start = end - dt.timedelta(days=days+1)
+    try:
+        r = requests.get(FX_TS_URL, params={"base":base, "symbols":symbol, "start_date":start.isoformat(), "end_date":end.isoformat()}, timeout=20)
+        r.raise_for_status()
+        js = r.json().get("rates", {})
+        rows=[]
+        for d, obj in sorted(js.items()):
+            val = obj.get(symbol)
+            if val: rows.append({"date": d, "rate": float(val)})
+        df = pd.DataFrame(rows).sort_values("date")
+        if df.empty: return df, None
+        df["ret"] = df["rate"].pct_change()
+        vol = float(df["ret"].dropna().std()*100.0) if df["ret"].dropna().shape[0] else None
+        return df, vol
+    except Exception:
+        return pd.DataFrame(), None
+
 @st.cache_data(show_spinner=True, ttl=3600)
 def fetch_comtrade(reporter="144", flow="1", years="2019,2020,2021,2022,2023", hs="300431"):
     params = {"type":"C","freq":"A","px":"HS","ps":years,"r":reporter,"p":"all","rg":flow,"cc":hs}
@@ -124,18 +147,23 @@ def fetch_comtrade(reporter="144", flow="1", years="2019,2020,2021,2022,2023", h
         r.raise_for_status()
         return pd.DataFrame(r.json().get("dataset", []))
     except Exception:
-        # fallback synthetic
+        # Fallback with 2 partners so KPIs are sane when offline
         data = [
             {"period":2019,"ptTitle":"India","TradeValue":12000000,"NetWeight":100000},
+            {"period":2019,"ptTitle":"Denmark","TradeValue":6000000,"NetWeight":40000},
             {"period":2020,"ptTitle":"India","TradeValue":13000000,"NetWeight":110000},
+            {"period":2020,"ptTitle":"Denmark","TradeValue":5000000,"NetWeight":38000},
             {"period":2021,"ptTitle":"India","TradeValue":16000000,"NetWeight":120000},
+            {"period":2021,"ptTitle":"Denmark","TradeValue":7000000,"NetWeight":46000},
             {"period":2022,"ptTitle":"India","TradeValue":20000000,"NetWeight":140000},
+            {"period":2022,"ptTitle":"Denmark","TradeValue":9000000,"NetWeight":52000},
             {"period":2023,"ptTitle":"India","TradeValue":24000000,"NetWeight":160000},
+            {"period":2023,"ptTitle":"Denmark","TradeValue":11000000,"NetWeight":60000},
         ]
         return pd.DataFrame(data)
 
 # geocoding & weather
-geolocator = Nominatim(user_agent="gtm_dashboard/2.0 (edu)")
+geolocator = Nominatim(user_agent="gtm_dashboard/2.1 (edu)")
 geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1, swallow_exceptions=True)
 
 @st.cache_data
@@ -159,7 +187,7 @@ def weather_risk(cur):
     wind = float(cur.get("wind_speed_10m", 0) or 0)
     precip = float(cur.get("precipitation", 0) or 0)
     if wind >= 12 or precip >= 5: return "High", f"Wind {wind} m/s, precip {precip} mm"
-    if wind >= 8 or precip >= 2: return "Moderate", f"Wind {wind} m/s, precip {precip} mm"
+    if wind >= 8 or precip >= 2:  return "Moderate", f"Wind {wind} m/s, precip {precip} mm"
     return "OK", f"Wind {wind} m/s, precip {precip} mm"
 
 # ========================= Live providers =========================
@@ -168,6 +196,7 @@ def parse_iata(text: str) -> Optional[str]:
     tok = (text.strip().split() or [""])[-1]
     return tok if len(tok)==3 and tok.isalpha() and tok.isupper() else None
 
+# Google/HERE live ETA
 def google_driving_eta(o: Tuple[float,float], d: Tuple[float,float]) -> Optional[int]:
     key = get_secret("GOOGLE_MAPS_KEY")
     if not key: return None
@@ -195,6 +224,7 @@ def here_driving_eta(o: Tuple[float,float], d: Tuple[float,float]) -> Optional[i
 def best_live_road_eta(o, d) -> Optional[int]:
     return google_driving_eta(o, d) or here_driving_eta(o, d)
 
+# AeroDataBox cargo boards
 def aerodatabox_board(endpoint: str, iata: str, limit: int = 10) -> pd.DataFrame:
     key = get_secret("AERODATABOX_KEY")
     if not key or not iata: return pd.DataFrame()
@@ -206,7 +236,6 @@ def aerodatabox_board(endpoint: str, iata: str, limit: int = 10) -> pd.DataFrame
         js = r.json()
         arr = js.get("arrivals") if "arrivals" in js else js.get("departures") if "departures" in js else js
         rows=[]
-        # cargo heuristic
         cargo_hints = {"cargo","freighter","fx","5x","qr cargo","ek skycargo","ups","dhl","cv","lx cargo","ey cargo","sq cargo","tk cargo","qr","ru"}
         cargo_prefix = {"FX","5X","5Y","CV","QY","RU","TK","QR","LH","SQ","EY","EK"}
         for it in (arr or [])[:limit*3]:
@@ -228,6 +257,7 @@ def aerodatabox_board(endpoint: str, iata: str, limit: int = 10) -> pd.DataFrame
     except Exception:
         return pd.DataFrame()
 
+# MarineTraffic cargo AIS
 def marinetraffic_cargo_bbox(lat: float, lon: float, box_km: float = 30) -> pd.DataFrame:
     key = get_secret("MARINETRAFFIC_KEY")
     if not key or lat is None or lon is None: return pd.DataFrame()
@@ -249,17 +279,42 @@ def marinetraffic_cargo_bbox(lat: float, lon: float, box_km: float = 30) -> pd.D
     except Exception:
         return pd.DataFrame()
 
+# HERE traffic incidents along corridor (bbox covering both points + 20% buffer)
+def here_traffic_incidents(a: Tuple[float,float], b: Tuple[float,float]) -> pd.DataFrame:
+    key = get_secret("HERE_API_KEY")
+    if not key or not a or not b: return pd.DataFrame()
+    min_lat, max_lat = min(a[0],b[0]), max(a[0],b[0])
+    min_lon, max_lon = min(a[1],b[1]), max(a[1],b[1])
+    # expand bbox slightly
+    pad_lat = (max_lat - min_lat) * 0.2 + 0.1
+    pad_lon = (max_lon - min_lon) * 0.2 + 0.1
+    top = max_lat + pad_lat; left = min_lon - pad_lon
+    bottom = min_lat - pad_lat; right = max_lon + pad_lon
+    url = "https://traffic.ls.hereapi.com/traffic/6.2/incidents.json"
+    params = {"bbox": f"{top},{left};{bottom},{right}", "criticality": "critical,major,minor", "apiKey": key, "locationreferences": "none"}
+    try:
+        r = requests.get(url, params=params, timeout=12); r.raise_for_status()
+        data = r.json()
+        items = (((data or {}).get("TRAFFICITEMS") or {}).get("TRAFFICITEM")) or []
+        rows=[]
+        for it in items:
+            crit = (it.get("CRITICALITY") or [{}])[0].get("DESCRIPTION","").lower()
+            cat  = (it.get("TRAFFICITEMTYPEDESC")) or it.get("TRAFFICITEMTYPEDESC") or ""
+            desc = (it.get("TRAFFICITEMDESCRIPTION") or [{}])[0].get("content","")
+            rows.append({"criticality": crit, "category": cat, "description": desc})
+        return pd.DataFrame(rows)
+    except Exception:
+        return pd.DataFrame()
+
 # ========================= Hero =========================
 st.markdown("""
 <div class="hero">
   <div class="hero-title">GTM Global Trade & Logistics Dashboard — Sri Lanka Focus</div>
-  <div class="hero-sub">Live trade • FX • Routes & map • Weather • Cargo flights • Cargo vessels • <b>Exact Incoterms & Landed Cost</b> • Packing • Scenarios</div>
+  <div class="hero-sub">Live trade • FX & volatility • Routes & map • Weather • Road ETA & Incidents • Cargo flights • Cargo AIS • Exact Incoterms • Packing • Scenarios</div>
 </div>
 """, unsafe_allow_html=True)
 
 # ========================= Global controls =========================
-fx_live = fetch_fx(); fx_rate_live = float(fx_live.get("LKR", 0) or 0)
-
 st.markdown("<div class='card'>", unsafe_allow_html=True)
 r1, r2 = st.columns([1.65, 1.35])
 
@@ -284,8 +339,9 @@ with r2:
     c = st.columns([1,1,1,1])
     with c[0]:
         st.markdown("<label>USD→LKR override</label>", unsafe_allow_html=True)
-        fx_override = st.number_input("fx", 0.0, value=0.0, step=0.01, label_visibility="collapsed")
-        fx_use = fx_override if fx_override>0 else fx_rate_live
+        fx_live = fetch_fx(); fx_rate_live = float(fx_live.get("LKR", 0) or 0)
+        fx_override = st.number_input("fx", min_value=0.0, step=0.01, value=0.0, key="w_fx", label_visibility="collapsed")
+        fx_use = fx_override if fx_override > 0 else (fx_rate_live if fx_rate_live > 0 else None)
     with c[1]:
         st.markdown("<label>Origin (City IATA/Port)</label>", unsafe_allow_html=True)
         origin_q = st.text_input("origin", value="Bengaluru BLR", label_visibility="collapsed")
@@ -334,40 +390,63 @@ if len(years_sorted)>=2:
     avg_yoy=float(np.mean(diffs)) if diffs else 0.0
     cagr_val=cagr(float(trend.loc[trend["year"]==years_sorted[0],"value_usd"]), float(trend.loc[trend["year"]==years_sorted[-1],"value_usd"]), len(years_sorted)-1)
 
+# FX timeseries (30d)
+fx_df, fx_vol = fetch_fx_timeseries(base="USD", symbol="LKR", days=30)
+
+# KPI row (clarified)
+period_lbl = f"{years.split(',')[0]}→{years.split(',')[-1]}"
+partners_count = partners_df["partner"].nunique() if not partners_df.empty else 0
+fx_disp = f"{fx_use:.2f}" if fx_use and fx_use > 0 else "—"
+
 st.markdown('<div class="kpi">', unsafe_allow_html=True)
-st.markdown(f'<div class="box"><p>Total Trade (USD)</p><h3>{total_trade:,.0f}</h3></div>', unsafe_allow_html=True)
-st.markdown(f'<div class="box"><p>Top Partner</p><h3>{_top["partner"]} ({float(_top["value_usd"]):,.0f})</h3></div>', unsafe_allow_html=True)
-st.markdown(f'<div class="box"><p># Partners</p><h3>{partners_df.shape[0]}</h3></div>', unsafe_allow_html=True)
-st.markdown(f'<div class="box"><p>Avg YoY Growth</p><h3>{avg_yoy*100:.1f}%</h3></div>', unsafe_allow_html=True)
-st.markdown(f'<div class="box"><p>CAGR</p><h3>{cagr_val*100:.1f}%</h3></div>', unsafe_allow_html=True)
-st.markdown(f'<div class="box"><p>FX USD→LKR</p><h3>{fx_use:.2f}</h3></div>', unsafe_allow_html=True)
-st.markdown("</div>", unsafe_allow_html=True)
+st.markdown(f'<div class="box"><p>Total Trade (USD, {period_lbl})</p><h3>{total_trade:,.0f}</h3></div>', unsafe_allow_html=True)
+tp_val = float(_top["value_usd"]) if not partners_df.empty else 0
+tp_name = _top["partner"] if not partners_df.empty else "—"
+st.markdown(f'<div class="box"><p>Top Partner</p><h3>{tp_name} ({tp_val:,.0f})</h3></div>', unsafe_allow_html=True)
+st.markdown(f'<div class="box"><p>Partners shown</p><h3>{partners_count}</h3></div>', unsafe_allow_html=True)
+st.markdown(f'<div class="box"><p>Avg YoY growth ({period_lbl})</p><h3>{avg_yoy*100:.1f}%</h3></div>', unsafe_allow_html=True)
+st.markdown(f'<div class="box"><p>CAGR ({period_lbl})</p><h3>{cagr_val*100:.1f}%</h3></div>', unsafe_allow_html=True)
+st.markdown(f'<div class="box"><p>FX USD→LKR</p><h3>{fx_disp}</h3></div>', unsafe_allow_html=True)
+st.markdown('</div>', unsafe_allow_html=True)
 
 # ========================= Live signals =========================
 o_pt = geocode_point(origin_q); d_pt = geocode_point(dest_q)
 
-t1,t2,t3,t4 = st.columns(4)
-with t1:
+tile1, tile2, tile3, tile4 = st.columns(4)
+with tile1:
     if o_pt and d_pt and mode=="Road":
         secs = best_live_road_eta((o_pt[0],o_pt[1]), (d_pt[0],d_pt[1]))
         if secs: st.metric("🚦 Road ETA (traffic)", f"{secs/3600:.1f} h")
-with t2:
+with tile2:
     oiata=parse_iata(origin_q)
     if oiata and get_secret("AERODATABOX_KEY"):
         deps = aerodatabox_board("departures", oiata, limit=5)
         st.metric("🛫 Cargo departures (origin)", "0" if deps.empty else str(len(deps)))
-with t3:
+with tile3:
     diata=parse_iata(dest_q)
     if diata and get_secret("AERODATABOX_KEY"):
         arrs = aerodatabox_board("arrivals", diata, limit=5)
         st.metric("🛬 Cargo arrivals (dest)", "0" if arrs.empty else str(len(arrs)))
-with t4:
+with tile4:
     if d_pt and get_secret("MARINETRAFFIC_KEY"):
         mt = marinetraffic_cargo_bbox(d_pt[0], d_pt[1], box_km=30)
         st.metric("⚓ Cargo vessels near dest", "0" if mt.empty else str(len(mt)))
 
+# FX volatility mini-card
+st.markdown("<div class='card'>", unsafe_allow_html=True)
+fxc1, fxc2 = st.columns([.35, .65])
+with fxc1:
+    if fx_vol is not None:
+        st.metric("FX volatility (30d stdev of daily returns)", f"{fx_vol:.2f}%")
+    else:
+        st.metric("FX volatility (30d)", "—")
+with fxc2:
+    if px is not None and not fx_df.empty:
+        st.plotly_chart(px.line(fx_df, x="date", y="rate", title="USD→LKR (last 30 days)"), use_container_width=True)
+st.markdown("</div>", unsafe_allow_html=True)
+
 # ========================= Charts & Map =========================
-left, right = st.columns([1.12,.88], gap="small")
+left, right = st.columns([1.12, .88], gap="small")
 
 with left:
     st.markdown("<div class='card'>", unsafe_allow_html=True)
@@ -391,9 +470,9 @@ with left:
     st.markdown("</div>", unsafe_allow_html=True)
 
 with right:
-    st.markdown("<div class='card'><b>Route • Lead Time • Weather • Cargo Boards • Cargo AIS • Emissions</b>", unsafe_allow_html=True)
+    st.markdown("<div class='card'><b>Route • Lead Time • Weather • Road Incidents • Cargo Boards • Cargo AIS • Emissions</b>", unsafe_allow_html=True)
 
-    # simple distance + lead time
+    # distance + lead time
     dist_km=None; lead_days=0.0
     if o_pt and d_pt:
         a=(o_pt[0],o_pt[1]); b=(d_pt[0],d_pt[1])
@@ -419,10 +498,23 @@ with right:
         orisk, omsg = weather_risk(ow); drisk, dmsg = weather_risk(dw)
         st.write(f"🌤️ Origin: **{orisk}** ({omsg}) · Destination: **{drisk}** ({dmsg})")
 
+        # Live road ETA text (if Road)
         if mode=="Road":
             secs = best_live_road_eta(a,b)
             if secs: st.write(f"🚚 **Live road ETA (traffic)**: ~{secs/3600:.1f} h")
 
+        # HERE traffic incidents expander
+        if get_secret("HERE_API_KEY"):
+            with st.expander("🛑 Road incidents on corridor (HERE)"):
+                inc = here_traffic_incidents(a,b)
+                if not inc.empty:
+                    total = len(inc); majors = inc[inc["criticality"].str.contains("critical|major", na=False)].shape[0]
+                    st.write(f"Incidents: **{total}** (critical/major: **{majors}**)")
+                    st.dataframe(inc.head(30), use_container_width=True, height=260)
+                else:
+                    st.write("No incidents returned.")
+
+        # Cargo boards
         oiata=parse_iata(origin_q); diata=parse_iata(dest_q)
         if get_secret("AERODATABOX_KEY") and (oiata or diata):
             with st.expander("✈️ Cargo flight boards"):
@@ -436,6 +528,7 @@ with right:
                     arr = aerodatabox_board("arrivals", diata, limit=10) if diata else pd.DataFrame()
                     if not arr.empty: st.dataframe(arr, use_container_width=True, height=240)
 
+        # Cargo AIS
         if d_pt and get_secret("MARINETRAFFIC_KEY"):
             with st.expander("🚢 Cargo vessels near destination"):
                 mt = marinetraffic_cargo_bbox(d_pt[0], d_pt[1], box_km=30)
@@ -458,7 +551,7 @@ st.markdown("<hr class='soft'/>", unsafe_allow_html=True)
 # ========================= Landed Cost — precise Incoterms =========================
 st.markdown("<div class='card'><b>Landed Cost • Exact Incoterms</b>", unsafe_allow_html=True)
 
-# 1) Inputs
+# Inputs
 lc1, lc2, lc3, lc4 = st.columns([1.1,1.1,1.1,1.1])
 with lc1:
     incoterm = st.selectbox("Incoterm",
@@ -480,8 +573,7 @@ with lc4:
     ins_amt  = st.number_input("Insurance amount (USD)", min_value=0.0, value=0.0, step=10.0)
     seller_pays_import_taxes = st.checkbox("Seller pays import taxes (DDP)", value=(incoterm=="DDP"))
 
-# 2) Incoterm matrix — what’s already included in invoice_value?
-# For customs value (CIF-equivalent) we must ensure freight/insurance are included exactly once.
+# Incoterm matrix
 INCOTERM_INCLUDES = {
     # freight, insurance
     "EXW": (False, False),
@@ -492,16 +584,16 @@ INCOTERM_INCLUDES = {
     "CIF": (True,  True),
     "CPT": (True,  False),
     "CIP": (True,  True),
-    "DAP": (True,  False),   # delivered to place, seller bears main carriage; insurance may or may not be sold, treat as not guaranteed
+    "DAP": (True,  False),
     "DPU": (True,  False),
-    "DDP": (True,  False),   # seller bears transport and import taxes; we handle taxes with checkbox above
+    "DDP": (True,  False),
 }
 freight_included, insurance_included = INCOTERM_INCLUDES.get(incoterm, (False, False))
 
-# 3) Compute insurance_add and freight_add for CUSTOMS value
+# Customs value (CIF-equivalent)
 freight_add_for_customs = 0.0 if freight_included else main_freight
 if insurance_included:
-    insurance_add_for_customs = 0.0   # already inside invoice_value
+    insurance_add_for_customs = 0.0
 else:
     if ins_mode == "Percent":
         base = invoice_value + (0.0 if freight_included else main_freight) if ins_base=="Invoice+Freight" else invoice_value
@@ -509,9 +601,9 @@ else:
     else:
         insurance_add_for_customs = ins_amt
 
-customs_value = invoice_value + freight_add_for_customs + insurance_add_for_customs  # CIF-equivalent for duty
+customs_value = invoice_value + freight_add_for_customs + insurance_add_for_customs
 
-# 4) Taxes
+# Taxes
 duty_pct = st.number_input("Import duty % (on customs value)", min_value=0.0, value=0.0, step=0.1)
 other_tax_pct = st.number_input("Other tariff/levy % (on customs value, optional)", min_value=0.0, value=0.0, step=0.1)
 vat_pct = st.number_input("VAT / GST % (on customs value + duty + other)", min_value=0.0, value=0.0, step=0.1)
@@ -521,20 +613,17 @@ other_tax = customs_value * (other_tax_pct/100.0)
 vat_base = customs_value + duty + other_tax
 vat = vat_base * (vat_pct/100.0)
 
-# 5) Buyer-pay total
-# If DDP (or the checkbox is ticked), seller already paid import taxes — do NOT add duty/other/vat to buyer total.
+# Buyer total (respect DDP)
 taxes_payable_by_buyer = 0.0 if seller_pays_import_taxes else (duty + other_tax + vat)
-
-# Buyer pays: invoice_value (whatever incoterm includes) + local charges + taxes they owe
 total_landed = (
     invoice_value
-    + (0.0 if freight_included else main_freight)   # if freight not in invoice, buyer actually pays it to carrier
-    + (0.0 if insurance_included else (insurance_add_for_customs if ins_mode=="Percent" else ins_amt))  # buyer’s insurance outlay if not included
+    + (0.0 if freight_included else main_freight)
+    + (0.0 if insurance_included else (insurance_add_for_customs if ins_mode=="Percent" else ins_amt))
     + origin_charges + dest_charges + brokerage + inland + other_local
     + taxes_payable_by_buyer
 )
 
-# 6) Outputs
+# Outputs
 o1,o2,o3,o4 = st.columns(4)
 with o1: st.metric("Customs value (CIF-equiv.)", f"${customs_value:,.0f}")
 with o2: st.metric("Duty", f"${duty:,.0f}")
@@ -546,10 +635,7 @@ with m1: st.metric("Buyer insurance outlay", f"${0.0 if insurance_included else 
 with m2: st.metric("Buyer freight outlay", f"${0.0 if freight_included else main_freight:,.0f}")
 with m3: st.metric("Taxes payable by buyer", f"${taxes_payable_by_buyer:,.0f}" + (" (DDP seller-paid)" if seller_pays_import_taxes else ""))
 with m4: st.metric("Total Landed Cost (USD)", f"${total_landed:,.0f}")
-
-if qty_units and qty_units>0:
-    st.caption(f"Landed cost per unit: **${(total_landed/qty_units):,.2f}**")
-
+if qty_units and qty_units>0: st.caption(f"Landed cost per unit: **${(total_landed/qty_units):,.2f}**")
 st.markdown("</div>", unsafe_allow_html=True)
 
 # ========================= Origin compare (what-if) =========================
@@ -562,7 +648,6 @@ comp = pd.DataFrame([
 rows=[]
 for _, r in comp.iterrows():
     fr_in, ins_in = INCOTERM_INCLUDES.get(r.Incoterm, (False,False))
-    # reuse same insurance rule for comparison
     fr_add = 0.0 if fr_in else r.Freight
     if ins_in:
         ins_add = 0.0
@@ -570,7 +655,7 @@ for _, r in comp.iterrows():
         ins_add = ( (r.Invoice + (0.0 if fr_in else r.Freight)) * (ins_pct/100.0) ) if ins_mode=="Percent" else ins_amt
     cv = r.Invoice + fr_add + ins_add
     duty_c = cv * (r["Duty%"]/100.0)
-    vat_c  = (cv + duty_c) * (vat_pct/100.0)
+    vat_c  = (cv + duty_c + (cv*other_tax_pct/100.0)) * (vat_pct/100.0)
     other_c= cv * (other_tax_pct/100.0)
     taxes_buyer = 0.0 if seller_pays_import_taxes else (duty_c + vat_c + other_c)
     tlc = (r.Invoice + (0.0 if fr_in else r.Freight) + (0.0 if ins_in else ins_add) +
@@ -581,7 +666,7 @@ st.dataframe(out, use_container_width=True)
 if px is not None: st.plotly_chart(px.bar(out, x="Origin", y="TLC_USD", title="Total Landed Cost by Origin (USD)"), use_container_width=True)
 st.markdown("</div>", unsafe_allow_html=True)
 
-# ========================= Packing & Scenarios (unchanged) =========================
+# ========================= Packing & Scenarios =========================
 st.markdown("<div class='card'><b>Packing • ULD & Container Capacity</b>", unsafe_allow_html=True)
 pc1,pc2,pc3 = st.columns(3)
 with pc1:
@@ -647,4 +732,4 @@ d1,d2 = st.columns(2)
 with d1: st.download_button("Download snapshot JSON", data=buf_json, file_name="gtm_snapshot.json", mime="application/json")
 with d2: st.download_button("Download snapshot CSV",  data=buf_csv.getvalue(), file_name="gtm_snapshot.csv",  mime="text/csv")
 
-st.caption("Educational tool. Always verify tariff & NTM rules with official sources (MACMAP, Sri Lanka Customs).")
+st.caption("Educational tool. Verify tariff/NTM rules with official sources (MACMAP, Sri Lanka Customs).")
